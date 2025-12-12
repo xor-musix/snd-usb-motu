@@ -1,5 +1,6 @@
 # VS Code workspace settings
 .vscode/
+.idea/
 
 # Kernel build intermediate and output files
 *.o

@@ -16,7 +16,15 @@ MODULE_DESCRIPTION("MOTU Pro Audio USB Driver");
 MODULE_AUTHOR("Dylan Robinson <dylan_robinson@motu.com>");
 MODULE_LICENSE("GPL v2");
 
-#define SAMPLE_RATE         48000
+/*
+ * Module parameters
+ *
+ * Allow selecting the sample rate at module load time.
+ * Supported rates: 44100, 48000, 88200, 96000, 176400, 192000.
+ */
+static int sample_rate = 48000;
+module_param(sample_rate, int, 0644);
+MODULE_PARM_DESC(sample_rate, "Sample rate in Hz (44100, 48000, 88200, 96000, 176400, 192000)");
 
 #define NUM_INTERRUPT_URBS  4
 #define NUM_URBS            4
@@ -28,30 +36,49 @@ MODULE_LICENSE("GPL v2");
 #define PB_SAFETY_OFFSET    16
 #define REC_SAFETY_OFFSET   16
 
-#if SAMPLE_RATE == 44100
-    #define NOM_SAMPLE_COUNT 6
-#elif SAMPLE_RATE == 48000
-    #define NOM_SAMPLE_COUNT 6
-#elif SAMPLE_RATE == 88200
-    #define NOM_SAMPLE_COUNT 11
-#elif SAMPLE_RATE == 96000
-    #define NOM_SAMPLE_COUNT 12
-#elif SAMPLE_RATE == 176400
-    #define NOM_SAMPLE_COUNT 22
-#elif SAMPLE_RATE == 192000
-    #define NOM_SAMPLE_COUNT 24
-#else
-    #error "Unsupported SAMPLE_RATE"
-#endif
+/* Derived at runtime from selected sample_rate */
+static int nom_sample_count;
 
-#define SNDRV_PCM_RATE_FLAG(sr) (               \
-    (sr) == 44100  ? SNDRV_PCM_RATE_44100  :    \
-    (sr) == 48000  ? SNDRV_PCM_RATE_48000  :    \
-    (sr) == 88200  ? SNDRV_PCM_RATE_88200  :    \
-    (sr) == 96000  ? SNDRV_PCM_RATE_96000  :    \
-    (sr) == 176400 ? SNDRV_PCM_RATE_176400 :    \
-    (sr) == 192000 ? SNDRV_PCM_RATE_192000 :    \
-    0                                           \
+static inline unsigned int rate_flag(unsigned int sr)
+{
+    switch (sr) {
+    case 44100:  return SNDRV_PCM_RATE_44100;
+    case 48000:  return SNDRV_PCM_RATE_48000;
+    case 88200:  return SNDRV_PCM_RATE_88200;
+    case 96000:  return SNDRV_PCM_RATE_96000;
+    case 176400: return SNDRV_PCM_RATE_176400;
+    case 192000: return SNDRV_PCM_RATE_192000;
+    default:     return 0;
+    }
+}
+
+static inline int compute_nom_sample_count(unsigned int sr)
+{
+    switch (sr) {
+    case 44100:
+    case 48000:
+        return 6;
+    case 88200:
+        return 11;
+    case 96000:
+        return 12;
+    case 176400:
+        return 22;
+    case 192000:
+        return 24;
+    default:
+        return -EINVAL;
+    }
+}
+
+/* Mask of all supported rates for initial hw template; narrowed at open() */
+#define SUPPORTED_RATES_MASK ( \
+    SNDRV_PCM_RATE_44100  | \
+    SNDRV_PCM_RATE_48000  | \
+    SNDRV_PCM_RATE_88200  | \
+    SNDRV_PCM_RATE_96000  | \
+    SNDRV_PCM_RATE_176400 | \
+    SNDRV_PCM_RATE_192000   \
 )
 
 #define CIRC_SUB(a, b, size)    (((a) + (size) - (b)) % (size))
@@ -138,9 +165,9 @@ static struct snd_pcm_hardware snd_motu_hw = {
              SNDRV_PCM_INFO_BLOCK_TRANSFER |
              SNDRV_PCM_INFO_BATCH),
     .formats =          SNDRV_PCM_FMTBIT_S24_3LE,
-    .rates =            SNDRV_PCM_RATE_FLAG(SAMPLE_RATE),
-    .rate_min =         SAMPLE_RATE,
-    .rate_max =         SAMPLE_RATE,
+    .rates =            SUPPORTED_RATES_MASK,
+    .rate_min =         SNDRV_PCM_RATE_44100,
+    .rate_max =         SNDRV_PCM_RATE_192000,
     .channels_min =     NUM_CH,
     .channels_max =     NUM_CH,
     .buffer_bytes_max = BYTES_PER_FRAME * 2048 * 4,
@@ -206,7 +233,7 @@ static void shred_sample_frames(unsigned char *buffer)
 {
     unsigned char *ptr = buffer;
 
-    for (int i = 0; i < (NOM_SAMPLE_COUNT + 1); ++i, ptr += BYTES_PER_FRAME)
+    for (int i = 0; i < (nom_sample_count + 1); ++i, ptr += BYTES_PER_FRAME)
         memcpy(ptr, motu_shred_pattern, BYTES_PER_FRAME);
 }
 
@@ -221,11 +248,11 @@ static unsigned int count_uframe_sample_frames(const unsigned char *buffer)
 {
     const unsigned char *ptr = buffer;
 
-    for (int i = 0; i < (NOM_SAMPLE_COUNT + 1); ++i, ptr += BYTES_PER_FRAME)
+    for (int i = 0; i < (nom_sample_count + 1); ++i, ptr += BYTES_PER_FRAME)
         if (!memcmp(ptr, motu_shred_pattern, BYTES_PER_FRAME))
             return i;
 
-    return (NOM_SAMPLE_COUNT + 1);
+    return (nom_sample_count + 1);
 }
 
 /*
@@ -500,7 +527,7 @@ static void capture_complete_urb(struct urb *urb)
     
     for (int i = 0; i < UFRAMES_PER_URB; ++i) {
         /* Nominal Packet Size */
-        unsigned int length = BYTES_PER_FRAME * NOM_SAMPLE_COUNT;
+        unsigned int length = BYTES_PER_FRAME * nom_sample_count;
         
         if (!urb->iso_frame_desc[i].status)
             length = urb->iso_frame_desc[i].actual_length;
@@ -827,6 +854,10 @@ static int capture_pcm_open(struct snd_pcm_substream *subs)
     dev_info(&priv->usb->dev, "capture_pcm_open\n");
 
     subs->runtime->hw = snd_motu_hw;
+    /* Narrow rates to the module-selected sample_rate */
+    subs->runtime->hw.rates = rate_flag(sample_rate);
+    subs->runtime->hw.rate_min = sample_rate;
+    subs->runtime->hw.rate_max = sample_rate;
 
     spin_lock(&priv->rec_stream.lock);
     priv->rec_stream.substream = subs;
@@ -863,7 +894,14 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *subs,
         params_periods(hw_params));
     dev_info(&priv->usb->dev, "Capture Period Size: %u\n",
         params_period_size(hw_params));
-    
+    /* Enforce selected sample_rate */
+    if (params_rate(hw_params) != sample_rate) {
+        dev_info(&priv->usb->dev,
+            "Unsupported sample rate requested: %u (module param: %d)\n",
+            params_rate(hw_params), sample_rate);
+        return -EINVAL;
+    }
+
     if (priv->pb_stream.period_frames &&
         priv->pb_stream.period_frames != params_period_size(hw_params)) {
         
@@ -959,6 +997,10 @@ static int playback_pcm_open(struct snd_pcm_substream *subs)
     dev_info(&priv->usb->dev, "playback_pcm_open\n");
 
     subs->runtime->hw = snd_motu_hw;
+    /* Narrow rates to the module-selected sample_rate */
+    subs->runtime->hw.rates = rate_flag(sample_rate);
+    subs->runtime->hw.rate_min = sample_rate;
+    subs->runtime->hw.rate_max = sample_rate;
 
     spin_lock(&priv->pb_stream.lock);
     priv->pb_stream.substream = subs;
@@ -998,6 +1040,14 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *subs,
     dev_info(&priv->usb->dev, "Playback Period Size: %u\n",
         params_period_size(hw_params));
     
+    /* Enforce selected sample_rate */
+    if (params_rate(hw_params) != sample_rate) {
+        dev_info(&priv->usb->dev,
+            "Unsupported sample rate requested: %u (module param: %d)\n",
+            params_rate(hw_params), sample_rate);
+        return -EINVAL;
+    }
+
     if (priv->rec_stream.period_frames &&
         priv->rec_stream.period_frames != params_period_size(hw_params)) {
         
@@ -1168,6 +1218,16 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
             return err;
         
         DO_ONCE(init_shred_pattern);
+
+        /* Validate and compute derived values from module parameters */
+        nom_sample_count = compute_nom_sample_count(sample_rate);
+        if (nom_sample_count < 0 || !rate_flag(sample_rate)) {
+            dev_err(&dev->dev, "Unsupported sample_rate: %d\n", sample_rate);
+            err = -EINVAL;
+            goto error_free_card_direct;
+        }
+        dev_info(&dev->dev, "Using sample_rate: %d Hz (nom_sample_count:%d)\n",
+                 sample_rate, nom_sample_count);
         
         priv = card->private_data;
         priv->usb = dev;
@@ -1249,6 +1309,9 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
 error_free:
     dev_info(&dev->dev, "Probe Error: Freeing Card\n");
     snd_card_free(priv->card);
+    return err;
+error_free_card_direct:
+    snd_card_free(card);
     return err;
 }
 
