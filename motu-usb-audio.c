@@ -36,8 +36,9 @@ MODULE_PARM_DESC(sample_rate, "Sample rate in Hz (44100, 48000, 88200, 96000, 17
 #define PB_SAFETY_OFFSET    16
 #define REC_SAFETY_OFFSET   16
 
-/* Derived at runtime from selected sample_rate */
-static int nom_sample_count;
+/* Derived at runtime from selected sample_rate (legacy global no longer used).
+ * Use priv->nom_sample_count instead.
+ */
 
 static inline unsigned int rate_flag(unsigned int sr)
 {
@@ -71,6 +72,8 @@ static inline int compute_nom_sample_count(unsigned int sr)
     }
 }
 
+/* set_runtime_rate is defined after struct motu_usb_data to ensure full type visibility */
+
 /* Mask of all supported rates for initial hw template; narrowed at open() */
 #define SUPPORTED_RATES_MASK ( \
     SNDRV_PCM_RATE_44100  | \
@@ -103,6 +106,7 @@ struct motu_stream
     bool enabled;
     spinlock_t lock;
     struct snd_pcm_substream *substream;
+    struct motu_usb_data *owner; /* back reference to parent */
     unsigned int period_frames;
     unsigned int period_count;
     unsigned int period_idx;
@@ -139,6 +143,9 @@ struct motu_usb_data
     int pb_adj;
     int pb_adj_total;
     enum pb_start_state pb_start_state;
+    /* Runtime sample-rate state */
+    unsigned int cur_rate;        /* 0 until set; in Hz */
+    int nom_sample_count;         /* derived from cur_rate */
 };
 
 struct motu_interrupt_msg
@@ -147,6 +154,29 @@ struct motu_interrupt_msg
     unsigned char attr;
     unsigned int frame;
 } __attribute__((packed));
+
+/*
+ * Now that struct motu_usb_data is fully defined, provide the implementation
+ * of set_runtime_rate(). This was previously placed too early, causing an
+ * incomplete type error when accessing fields of motu_usb_data.
+ */
+static int set_runtime_rate(struct motu_usb_data *priv, unsigned int rate)
+{
+    int nsc;
+
+    if (!rate_flag(rate))
+        return -EINVAL;
+
+    nsc = compute_nom_sample_count(rate);
+    if (nsc < 0)
+        return -EINVAL;
+
+    priv->cur_rate = rate;
+    priv->nom_sample_count = nsc;
+    dev_info(&priv->usb->dev, "Set runtime rate: %u Hz (nom_sample_count:%d)\n",
+             rate, nsc);
+    return 0;
+}
 
 struct class_interrupt_msg
 {
@@ -229,11 +259,11 @@ static void init_shred_pattern(void)
 }
 
 /* Write the shred pattern to the audio buffer. */
-static void shred_sample_frames(unsigned char *buffer)
+static void shred_sample_frames(struct motu_stream *stream, unsigned char *buffer)
 {
     unsigned char *ptr = buffer;
 
-    for (int i = 0; i < (nom_sample_count + 1); ++i, ptr += BYTES_PER_FRAME)
+    for (int i = 0; i < (stream->owner->nom_sample_count + 1); ++i, ptr += BYTES_PER_FRAME)
         memcpy(ptr, motu_shred_pattern, BYTES_PER_FRAME);
 }
 
@@ -244,15 +274,15 @@ static void shred_sample_frames(unsigned char *buffer)
  *
  * Return: number of contiguous filled sample frames
  */
-static unsigned int count_uframe_sample_frames(const unsigned char *buffer)
+static unsigned int count_uframe_sample_frames(struct motu_usb_data *priv, const unsigned char *buffer)
 {
     const unsigned char *ptr = buffer;
 
-    for (int i = 0; i < (nom_sample_count + 1); ++i, ptr += BYTES_PER_FRAME)
+    for (int i = 0; i < (priv->nom_sample_count + 1); ++i, ptr += BYTES_PER_FRAME)
         if (!memcmp(ptr, motu_shred_pattern, BYTES_PER_FRAME))
             return i;
 
-    return (nom_sample_count + 1);
+    return (priv->nom_sample_count + 1);
 }
 
 /*
@@ -270,7 +300,7 @@ static void count_sample_frames(struct motu_usb_data *priv)
     for (int i = 0; i < UFRAMES_PER_URB; ++i) {
         struct motu_buf *buf = &rec_stream->bufs[chase_pos];
         
-        buf->length = count_uframe_sample_frames(buf->data);
+        buf->length = count_uframe_sample_frames(priv, buf->data);
         
         if (buf->length) {
             count += prev_frames;
@@ -366,7 +396,7 @@ static void sync_period_from_usb(struct motu_stream *stream,
         
         stream->copy_frame += frames_this_copy;
         if (stream->copy_frame >= src_buf->length) {
-            shred_sample_frames(stream->bufs[stream->copy_pos].data);
+            shred_sample_frames(stream, stream->bufs[stream->copy_pos].data);
             stream->copy_frame = 0;
             stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
         }
@@ -404,7 +434,7 @@ static void copy_period_from_usb(struct motu_stream *stream,
         
         stream->copy_frame += frames_this_copy;
         if (stream->copy_frame >= src_buf->length) {
-            shred_sample_frames(stream->bufs[stream->copy_pos].data);
+            shred_sample_frames(stream, stream->bufs[stream->copy_pos].data);
             stream->copy_frame = 0;
             stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
         }
@@ -432,7 +462,7 @@ static void handle_interval_interrupt(struct motu_usb_data *priv)
 
         while (discard > 0) {
             discard -= rec_stream->bufs[rec_stream->copy_pos].length;
-            shred_sample_frames(rec_stream->bufs[rec_stream->copy_pos].data);
+            shred_sample_frames(rec_stream, rec_stream->bufs[rec_stream->copy_pos].data);
             ++rec_stream->copy_pos;
         }
 
@@ -527,7 +557,7 @@ static void capture_complete_urb(struct urb *urb)
     
     for (int i = 0; i < UFRAMES_PER_URB; ++i) {
         /* Nominal Packet Size */
-        unsigned int length = BYTES_PER_FRAME * nom_sample_count;
+        unsigned int length = BYTES_PER_FRAME * priv->nom_sample_count;
         
         if (!urb->iso_frame_desc[i].status)
             length = urb->iso_frame_desc[i].actual_length;
@@ -622,7 +652,7 @@ static void start_streaming_endpoints(struct work_struct *work)
     }
 
     for (int i = 0; i < UFRAMES_PER_URB; ++i)
-        shred_sample_frames(priv->rec_stream.bufs[i].data);
+        shred_sample_frames(&priv->rec_stream, priv->rec_stream.bufs[i].data);
 
     set_interrupt_interval(priv, interval);
     usb_set_interface(priv->usb, 2, 1); // start record
@@ -854,10 +884,6 @@ static int capture_pcm_open(struct snd_pcm_substream *subs)
     dev_info(&priv->usb->dev, "capture_pcm_open\n");
 
     subs->runtime->hw = snd_motu_hw;
-    /* Narrow rates to the module-selected sample_rate */
-    subs->runtime->hw.rates = rate_flag(sample_rate);
-    subs->runtime->hw.rate_min = sample_rate;
-    subs->runtime->hw.rate_max = sample_rate;
 
     spin_lock(&priv->rec_stream.lock);
     priv->rec_stream.substream = subs;
@@ -883,23 +909,30 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *subs,
             struct snd_pcm_hw_params *hw_params)
 {
     struct motu_usb_data *priv = subs->private_data;
+    unsigned int rate = params_rate(hw_params);
+    int err;
 
     dev_info(&priv->usb->dev, "Capture Channels: %u\n",
         params_channels(hw_params));
     dev_info(&priv->usb->dev, "Capture Sample Rate: %u\n",
-        params_rate(hw_params));
+        rate);
     dev_info(&priv->usb->dev, "Capture Buffer Bytes: %u\n",
         params_buffer_bytes(hw_params));
     dev_info(&priv->usb->dev, "Capture Periods: %u\n",
         params_periods(hw_params));
     dev_info(&priv->usb->dev, "Capture Period Size: %u\n",
         params_period_size(hw_params));
-    /* Enforce selected sample_rate */
-    if (params_rate(hw_params) != sample_rate) {
-        dev_info(&priv->usb->dev,
-            "Unsupported sample rate requested: %u (module param: %d)\n",
-            params_rate(hw_params), sample_rate);
+
+    if (!rate_flag(rate))
         return -EINVAL;
+
+    if (!priv->cur_rate || priv->cur_rate != rate) {
+        bool running = atomic_read(&priv->streams_started);
+        err = set_runtime_rate(priv, rate);
+        if (err)
+            return err;
+        if (running)
+            restart_streaming_endpoints(priv);
     }
 
     if (priv->pb_stream.period_frames &&
@@ -997,10 +1030,6 @@ static int playback_pcm_open(struct snd_pcm_substream *subs)
     dev_info(&priv->usb->dev, "playback_pcm_open\n");
 
     subs->runtime->hw = snd_motu_hw;
-    /* Narrow rates to the module-selected sample_rate */
-    subs->runtime->hw.rates = rate_flag(sample_rate);
-    subs->runtime->hw.rate_min = sample_rate;
-    subs->runtime->hw.rate_max = sample_rate;
 
     spin_lock(&priv->pb_stream.lock);
     priv->pb_stream.substream = subs;
@@ -1028,24 +1057,30 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *subs,
             struct snd_pcm_hw_params *hw_params)
 {
     struct motu_usb_data *priv = subs->private_data;
+    unsigned int rate = params_rate(hw_params);
+    int err;
 
     dev_info(&priv->usb->dev, "Playback Channels: %u\n",
         params_channels(hw_params));
     dev_info(&priv->usb->dev, "Playback Sample Rate: %u\n",
-        params_rate(hw_params));
+        rate);
     dev_info(&priv->usb->dev, "Playback Buffer Bytes: %u\n",
         params_buffer_bytes(hw_params));
     dev_info(&priv->usb->dev, "Playback Periods: %u\n",
         params_periods(hw_params));
     dev_info(&priv->usb->dev, "Playback Period Size: %u\n",
         params_period_size(hw_params));
-    
-    /* Enforce selected sample_rate */
-    if (params_rate(hw_params) != sample_rate) {
-        dev_info(&priv->usb->dev,
-            "Unsupported sample rate requested: %u (module param: %d)\n",
-            params_rate(hw_params), sample_rate);
+
+    if (!rate_flag(rate))
         return -EINVAL;
+
+    if (!priv->cur_rate || priv->cur_rate != rate) {
+        bool running = atomic_read(&priv->streams_started);
+        err = set_runtime_rate(priv, rate);
+        if (err)
+            return err;
+        if (running)
+            restart_streaming_endpoints(priv);
     }
 
     if (priv->rec_stream.period_frames &&
@@ -1219,19 +1254,24 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
         
         DO_ONCE(init_shred_pattern);
 
-        /* Validate and compute derived values from module parameters */
-        nom_sample_count = compute_nom_sample_count(sample_rate);
-        if (nom_sample_count < 0 || !rate_flag(sample_rate)) {
+        /* Initialize runtime sample rate from module parameter (default). */
+        if (!rate_flag(sample_rate)) {
             dev_err(&dev->dev, "Unsupported sample_rate: %d\n", sample_rate);
             err = -EINVAL;
             goto error_free_card_direct;
         }
-        dev_info(&dev->dev, "Using sample_rate: %d Hz (nom_sample_count:%d)\n",
-                 sample_rate, nom_sample_count);
         
         priv = card->private_data;
         priv->usb = dev;
         priv->card = card;
+        priv->rec_stream.owner = priv;
+        priv->pb_stream.owner = priv;
+
+        err = set_runtime_rate(priv, sample_rate);
+        if (err) {
+            dev_err(&dev->dev, "Failed to set initial rate %d: %d\n", sample_rate, err);
+            goto error_free_card_direct;
+        }
 
         usb_set_intfdata(intf, priv);
 

@@ -27,13 +27,14 @@ Currently **only USB 2.0 models** are supported:
 
 - **Audio streaming only**
 - Control/configuration must be done via the device’s web UI over Ethernet
-- Works only at **SAMPLE_RATE** sample rate (default: 48 kHz)
-- Does not handle clock lock loss — you must ensure the device is locked at SAMPLE_RATE **before** connecting to the computer
+- Default sample rate is 48 kHz, configurable at module load via `sample_rate=<Hz>`
+- Runtime sample-rate changes are supported via ALSA `hw_params` (e.g., `aplay -r 96000`). The driver stops, reconfigures, and restarts USB streams automatically when the app requests a different supported rate
+- Device clock must already be configured/locked to the requested rate. Clock source and rate are not changed by the driver. If the hardware isn't locked to the requested rate, audio may fail to start or underrun/overrun
 - Debug logging (`sudo dmesg -w` to view)
 
 ## Planned Improvements
 
-- Changing clock rate
+- Changing device clock rate from the driver
 - Handling clock loss
 - 64 channels
 
