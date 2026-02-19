@@ -5,6 +5,7 @@
 #include <linux/module.h>
 #include <linux/once.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/usb.h>
 #include <linux/workqueue.h>
 #include <sound/core.h>
@@ -136,6 +137,8 @@ struct motu_usb_data
     unsigned int rx_frames;
     int pb_adj;
     int pb_adj_total;
+    bool disconnected;
+    struct mutex pcm_mutex;
     enum pb_start_state pb_start_state;
     /* Runtime sample-rate state */
     unsigned int cur_rate;        /* 0 until set; in Hz */
@@ -512,12 +515,16 @@ static void handle_status_interrupt(struct class_interrupt_msg *msg,
 static void interrupt_complete_urb(struct urb* urb)
 {
     struct motu_interrupt_msg *msg = urb->transfer_buffer;
-    
+    struct motu_usb_data *priv = urb->context;
+
+    if (!priv || priv->disconnected)
+        return;
+
     if (urb->status == 0) {
         if (msg->info == 0x01 && msg->attr == 0x01)
-            handle_interval_interrupt(urb->context);
+            handle_interval_interrupt(priv);
         else
-            handle_status_interrupt(urb->transfer_buffer, urb->context);
+            handle_status_interrupt(urb->transfer_buffer, priv);
     }
 
     usb_submit_urb(urb, GFP_ATOMIC);
@@ -537,7 +544,9 @@ static void capture_complete_urb(struct urb *urb)
     struct urb *pb_urb;
     struct motu_buf *pb_bufs;
 
-    if (!atomic_read(&priv->streams_started))
+    if (!priv || 
+        priv->disconnected || 
+        !atomic_read(&priv->streams_started))
         return;
     
     pb_urb = priv->pb_stream.urbs[priv->urb_idx];
@@ -842,6 +851,9 @@ static void queue_start_streaming(struct snd_pcm_substream *subs)
 {
     struct motu_usb_data *priv = subs->private_data;
 
+    if (priv->disconnected)
+        return;
+
     cancel_delayed_work(&priv->stop_streams_work);
     
     spin_lock(&priv->wq_lock);
@@ -853,6 +865,9 @@ static void queue_start_streaming(struct snd_pcm_substream *subs)
 static void maybe_queue_stop_streaming(struct snd_pcm_substream *subs)
 {
     struct motu_usb_data *priv = subs->private_data;
+
+    if (priv->disconnected)
+        return;
 
     if (priv->rec_stream.enabled || priv->pb_stream.enabled)
         return;
@@ -869,6 +884,9 @@ static void maybe_queue_stop_streaming(struct snd_pcm_substream *subs)
 static int capture_pcm_open(struct snd_pcm_substream *subs)
 {
     struct motu_usb_data *priv = subs->private_data;
+
+    if (priv->disconnected)
+        return -ENODEV;
 
     dev_info(&priv->usb->dev, "capture_pcm_open\n");
 
@@ -900,6 +918,9 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *subs,
     struct motu_usb_data *priv = subs->private_data;
     unsigned int rate = params_rate(hw_params);
     int err;
+
+    if (priv->disconnected)
+        return -ENODEV;
 
     dev_info(&priv->usb->dev, "Capture Channels: %u\n",
         params_channels(hw_params));
@@ -946,13 +967,32 @@ static int capture_pcm_hw_free(struct snd_pcm_substream *subs)
 {
     struct motu_usb_data *priv = subs->private_data;
 
+    dev_info(&priv->usb->dev,
+         "DEBUG: capture_pcm_hw_free() invoked (disconnected=%d, streams_started=%d)\n",
+         priv->disconnected,
+         atomic_read(&priv->streams_started));
+
+    if (priv->disconnected)
+        return 0;
+
     dev_info(&priv->usb->dev, "capture_pcm_hw_free\n");
+
+    mutex_lock(&priv->pcm_mutex);
 
     spin_lock(&priv->rec_stream.lock);
     priv->rec_stream.period_frames = 0;
     spin_unlock(&priv->rec_stream.lock);
 
     priv->rec_stream.enabled = false;
+
+    cancel_delayed_work_sync(&priv->start_streams_work);
+    cancel_delayed_work_sync(&priv->stop_streams_work);
+
+    /* Ensure URBs are stopped before ALSA teardown continues */
+    stop_streaming_endpoints(&priv->stop_streams_work.work);
+
+    mutex_unlock(&priv->pcm_mutex);
+
     maybe_queue_stop_streaming(subs);
 
     return 0;
@@ -961,6 +1001,9 @@ static int capture_pcm_hw_free(struct snd_pcm_substream *subs)
 static int capture_pcm_prepare(struct snd_pcm_substream *subs)
 {
     struct motu_usb_data *priv = subs->private_data;
+
+    if (priv->disconnected)
+        return -ENODEV;
 
     dev_info(&priv->usb->dev, "capture_pcm_prepare\n");
 
@@ -974,6 +1017,9 @@ static int capture_pcm_prepare(struct snd_pcm_substream *subs)
 static int capture_pcm_trigger(struct snd_pcm_substream *subs, int cmd)
 {
     struct motu_usb_data *priv = subs->private_data;
+
+    if (priv->disconnected)
+        return -ENODEV;
 
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
@@ -1255,6 +1301,9 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
         priv->card = card;
         priv->rec_stream.owner = priv;
         priv->pb_stream.owner = priv;
+        priv->disconnected = false;
+
+        mutex_init(&priv->pcm_mutex);
 
         err = set_runtime_rate(priv, sample_rate);
         if (err) {
@@ -1355,6 +1404,7 @@ static void motu_usb_audio_disconnect(struct usb_interface *intf)
     if ((ifnum == 0) && priv) {
         struct workqueue_struct *wq = priv->start_stop_wq;
         dev_info(&dev->dev, "Disconnect: Freeing Card\n");
+        priv->disconnected = true;
         snd_card_disconnect(priv->card);
         spin_lock(&priv->wq_lock);
         priv->start_stop_wq = NULL;
