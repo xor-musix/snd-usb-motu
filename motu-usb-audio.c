@@ -408,23 +408,7 @@ static void copy_frames_to_usb(struct motu_stream *stream, unsigned int frames)
     }
 }
 
-static void handle_interval_interrupt(struct motu_usb_data *priv)
-{
-    struct motu_stream *pb_stream = &priv->pb_stream;
-
-    /* Apply any pending playback adjustment */
-    if (priv->pb_adj) {
-        unsigned long flags;
-        spin_lock_irqsave(&pb_stream->lock, flags);
-        pb_stream->copy_pos =
-            (pb_stream->copy_pos + priv->pb_adj) % TOTAL_UFRAMES;
-        priv->pb_adj_total += priv->pb_adj;
-        priv->pb_adj = 0;
-        spin_unlock_irqrestore(&pb_stream->lock, flags);
-    }
-}
-
-static void handle_status_interrupt(struct class_interrupt_msg *msg,
+static void handle_status_interrupt(struct motu_interrupt_msg *msg,
     struct motu_usb_data *priv)
 {
     /*
@@ -443,9 +427,7 @@ static void interrupt_complete_urb(struct urb* urb)
         return;
 
     if (urb->status == 0) {
-        if (msg->info == 0x01 && msg->attr == 0x01)
-            handle_interval_interrupt(priv);
-        else
+        if (!(msg->info == 0x01 && msg->attr == 0x01))
             handle_status_interrupt(urb->transfer_buffer, priv);
     }
 
@@ -518,6 +500,16 @@ static void capture_complete_urb(struct urb *urb)
         spin_lock(&rec_stream->lock);
         copy_frames_from_usb(rec_stream, urb_frames);
         spin_unlock(&rec_stream->lock);
+    }
+
+    /* Playback adjustment from handle_interval_interrupt */
+    if (priv->pb_adj) {
+        spin_lock(&pb_stream->lock);
+        pb_stream->copy_pos =
+            (pb_stream->copy_pos + priv->pb_adj) % TOTAL_UFRAMES;
+        priv->pb_adj_total += priv->pb_adj;
+        priv->pb_adj = 0;
+        spin_unlock(&pb_stream->lock);
     }
 
     /* Playback: fill outgoing URB from ALSA buffer */
@@ -621,7 +613,7 @@ static void start_streaming_endpoints(struct work_struct *work)
     for (int i = 0; i < TOTAL_UFRAMES; ++i)
         shred_sample_frames(&priv->rec_stream, priv->rec_stream.bufs[i].data);
 
-    set_interrupt_interval(priv, interval);
+    set_interrupt_interval(priv, 1);
     usb_set_interface(priv->usb, 2, 1); // start record
     usb_set_interface(priv->usb, 1, 1); // start playback
 
