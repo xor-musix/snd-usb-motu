@@ -28,8 +28,8 @@ module_param(sample_rate, int, 0644);
 MODULE_PARM_DESC(sample_rate, "Sample rate in Hz (44100, 48000, 88200, 96000, 176400, 192000)");
 
 #define NUM_INTERRUPT_URBS  4
-#define NUM_URBS            4
-#define UFRAMES_PER_URB     512
+#define NUM_URBS            32
+#define UFRAMES_PER_URB     8
 #define TOTAL_UFRAMES       (NUM_URBS * UFRAMES_PER_URB)
 #define NUM_CH              24
 #define BYTES_PER_SAMPLE    3
@@ -79,7 +79,6 @@ static inline int compute_nom_sample_count(unsigned int sr)
     SNDRV_PCM_RATE_192000   \
 )
 
-#define CIRC_SUB(a, b, size)    (((a) + (size) - (b)) % (size))
 
 static struct usb_driver snd_usb_motu_driver;
 
@@ -133,7 +132,6 @@ struct motu_usb_data
     struct motu_stream rec_stream;
     struct motu_stream pb_stream;
     unsigned int urb_idx;
-    unsigned int chase_pos;
     unsigned int rx_frames;
     int pb_adj;
     int pb_adj_total;
@@ -183,9 +181,7 @@ struct class_interrupt_msg
 static struct snd_pcm_hardware snd_motu_hw = {
     .info = (SNDRV_PCM_INFO_MMAP |
              SNDRV_PCM_INFO_MMAP_VALID |
-             SNDRV_PCM_INFO_INTERLEAVED |
-             SNDRV_PCM_INFO_BLOCK_TRANSFER |
-             SNDRV_PCM_INFO_BATCH),
+             SNDRV_PCM_INFO_INTERLEAVED),
     .formats =          SNDRV_PCM_FMTBIT_S24_3LE,
     .rates =            SUPPORTED_RATES_MASK,
     .rate_min =         44100,
@@ -227,18 +223,24 @@ static unsigned int substream_position_bytes(const struct motu_stream *stream)
  */
 static bool inc_frame_position(struct motu_stream *stream, unsigned int count)
 {
+    if (!stream->period_frames)
+        return false;
+
     stream->frame_pos += count;
 
     if (stream->frame_pos >= stream->period_frames) {
-        stream->frame_pos -= stream->period_frames;
+        stream->frame_pos %= stream->period_frames;
         
-        if (++stream->period_idx >= stream->period_count)
-            stream->period_idx = 0;
+        stream->period_idx = (stream->period_idx + 1) % stream->period_count;
         
-        stream->hw_ptr = stream->period_idx * stream->period_frames;
+        stream->hw_ptr = stream->period_idx * stream->period_frames + stream->frame_pos;
         
         return true;
     }
+
+    /* Sub-period hw_ptr tracking */
+    stream->hw_ptr = (stream->period_idx * stream->period_frames) +
+                     stream->frame_pos;
 
     return false;
 }
@@ -259,246 +261,166 @@ static void shred_sample_frames(struct motu_stream *stream, unsigned char *buffe
         memcpy(ptr, motu_shred_pattern, BYTES_PER_FRAME);
 }
 
+
 /*
- * Count how many contiguous audio sample frames at the start of a USB
- * microframe buffer have been filled by the device (i.e. not equal to
- * the shred pattern).
+ * copy_frames_from_usb - Incrementally copy capture frames to ALSA buffer
+ * @stream: capture stream
+ * @frames: number of frames to copy from current buf position
  *
- * Return: number of contiguous filled sample frames
+ * Copies frames and signals period elapsed when a full period is accumulated.
+ * Must be called with stream->lock held.
  */
-static unsigned int count_uframe_sample_frames(struct motu_usb_data *priv, const unsigned char *buffer)
+static void copy_frames_from_usb(struct motu_stream *stream, unsigned int frames)
 {
-    const unsigned char *ptr = buffer;
-
-    for (int i = 0; i < (priv->nom_sample_count + 1); ++i, ptr += BYTES_PER_FRAME)
-        if (!memcmp(ptr, motu_shred_pattern, BYTES_PER_FRAME))
-            return i;
-
-    return (priv->nom_sample_count + 1);
-}
-
-/*
- * Count the total number of audio sample frames that have been filled by
- * the device across consecutive USB microframe buffers, starting from
- * priv->chase_pos.
- */
-static void count_sample_frames(struct motu_usb_data *priv)
-{
-    struct motu_stream *rec_stream = &priv->rec_stream;
-    unsigned int chase_pos = priv->chase_pos;
-    unsigned int prev_frames = 0;
-    unsigned int count = 0;
-
-    for (int i = 0; i < UFRAMES_PER_URB; ++i) {
-        struct motu_buf *buf = &rec_stream->bufs[chase_pos];
-        
-        buf->length = count_uframe_sample_frames(priv, buf->data);
-        
-        if (buf->length) {
-            count += prev_frames;
-            prev_frames = buf->length;
-        }
-        else if (count) {
-            /* step back two to recheck last buffer next time */
-            priv->chase_pos = CIRC_SUB(chase_pos, 2, TOTAL_UFRAMES);
-            break;
-        }
-        else if (i > 32) {
-            /* too many buffers without finding any frames */
-            break;
-        }
-        
-        chase_pos = (chase_pos + 1) % TOTAL_UFRAMES;
-    }
-
-    priv->rx_frames += count;
-}
-
-static void mute_period_to_usb(struct motu_stream *stream,
-    unsigned int period_size)
-{
-    while (period_size) {
-        struct motu_buf *dst_buf = &stream->bufs[stream->copy_pos];
-        unsigned int dst_frames = dst_buf->length - stream->copy_frame;
-        unsigned int frames_this_copy = min(period_size, dst_frames);
-        unsigned int bytes_this_copy = frames_this_copy * BYTES_PER_FRAME;
-        unsigned int dst_offset = stream->copy_frame * BYTES_PER_FRAME;
-
-        memset(dst_buf->data + dst_offset, 0, bytes_this_copy);
-
-        period_size -= frames_this_copy;
-        
-        stream->copy_frame += frames_this_copy;
-        if (stream->copy_frame >= dst_buf->length) {
-            stream->copy_frame = 0;
-            stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
-        }
-    }
-}
-
-static void copy_period_to_usb(struct motu_stream *stream,
-    unsigned int period_size)
-{
-    unsigned char* src;
-    unsigned int src_offset;
-
-    if (period_size != stream->period_frames) {
-        mute_period_to_usb(stream, period_size);
-        return;
-    }
-    
-    src = stream->substream->runtime->dma_area;
-    src_offset = substream_position_bytes(stream);
-
-    while (period_size) {
-        struct motu_buf *dst_buf = &stream->bufs[stream->copy_pos];
-        unsigned int dst_frames = dst_buf->length - stream->copy_frame;
-        unsigned int frames_this_copy = min(period_size, dst_frames);
-        unsigned int bytes_this_copy = frames_this_copy * BYTES_PER_FRAME;
-        unsigned int dst_offset = stream->copy_frame * BYTES_PER_FRAME;
-
-        memcpy(dst_buf->data + dst_offset, src + src_offset, bytes_this_copy);
-        
-        src_offset += bytes_this_copy;
-        period_size -= frames_this_copy;
-        
-        stream->copy_frame += frames_this_copy;
-        if (stream->copy_frame >= dst_buf->length) {
-            stream->copy_frame = 0;
-            stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
-        }
-    }
-
-    inc_frame_position(stream, stream->period_frames);
-    snd_pcm_period_elapsed(stream->substream);
-}
-
-static void sync_period_from_usb(struct motu_stream *stream,
-    unsigned int period_size)
-{
-    while (period_size) {
-        struct motu_buf *src_buf = &stream->bufs[stream->copy_pos];
-        unsigned int src_frames = src_buf->length - stream->copy_frame;
-        unsigned int frames_this_copy = min(period_size, src_frames);
-
-        if (!frames_this_copy)
-            break;
-
-        period_size -= frames_this_copy;
-        
-        stream->copy_frame += frames_this_copy;
-        if (stream->copy_frame >= src_buf->length) {
-            shred_sample_frames(stream, stream->bufs[stream->copy_pos].data);
-            stream->copy_frame = 0;
-            stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
-        }
-    }
-}
-
-static void copy_period_from_usb(struct motu_stream *stream,
-    unsigned int period_size)
-{
-    unsigned char* dst;
+    unsigned char *dst;
     unsigned int dst_offset;
+    unsigned int buffer_size_bytes;
 
-    if (period_size != stream->period_frames) {
-        sync_period_from_usb(stream, period_size);
+    if (!stream->enabled || !stream->substream || !stream->substream->runtime ||
+        !stream->period_frames)
         return;
-    }
-    
-    dst = stream->substream->runtime->dma_area;
-    dst_offset = substream_position_bytes(stream);
 
-    while (period_size) {
+    dst = stream->substream->runtime->dma_area;
+    buffer_size_bytes = stream->period_count * stream->period_frames * BYTES_PER_FRAME;
+
+    if (!dst || !buffer_size_bytes)
+        return;
+
+    while (frames) {
         struct motu_buf *src_buf = &stream->bufs[stream->copy_pos];
         unsigned int src_frames = src_buf->length - stream->copy_frame;
-        unsigned int frames_this_copy = min(period_size, src_frames);
+        unsigned int frames_this_copy = min(frames, src_frames);
         unsigned int bytes_this_copy = frames_this_copy * BYTES_PER_FRAME;
         unsigned int src_offset = stream->copy_frame * BYTES_PER_FRAME;
 
         if (!frames_this_copy)
             break;
 
-        memcpy(dst + dst_offset, src_buf->data + src_offset, bytes_this_copy);
-
-        dst_offset += bytes_this_copy;
-        period_size -= frames_this_copy;
+        dst_offset = substream_position_bytes(stream);
         
+        if (dst_offset >= buffer_size_bytes) {
+            /* Should not happen with correct inc_frame_position logic, but safety first */
+            reset_substream_position(stream);
+            dst_offset = 0;
+        }
+
+        /* Copy only up to the end of the buffer; next iteration handles wrap */
+        if ((dst_offset + bytes_this_copy) > buffer_size_bytes) {
+            bytes_this_copy = buffer_size_bytes - dst_offset;
+            frames_this_copy = bytes_this_copy / BYTES_PER_FRAME;
+        }
+
+        if (bytes_this_copy > 0)
+            memcpy(dst + dst_offset, src_buf->data + src_offset, bytes_this_copy);
+
+        frames -= frames_this_copy;
+
         stream->copy_frame += frames_this_copy;
         if (stream->copy_frame >= src_buf->length) {
-            shred_sample_frames(stream, stream->bufs[stream->copy_pos].data);
             stream->copy_frame = 0;
             stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
         }
+
+        if (inc_frame_position(stream, frames_this_copy))
+            snd_pcm_period_elapsed(stream->substream);
+    }
+}
+
+/*
+ * copy_frames_to_usb - Incrementally copy playback frames from ALSA buffer
+ * @stream: playback stream
+ * @frames: number of frames to fill in current buf position
+ *
+ * Copies frames and signals period elapsed when a full period is consumed.
+ * Must be called with stream->lock held.
+ */
+static void copy_frames_to_usb(struct motu_stream *stream, unsigned int frames)
+{
+    unsigned char *src;
+    unsigned int src_offset;
+    unsigned int buffer_size_bytes;
+
+    if (!stream->enabled || !stream->substream || !stream->substream->runtime ||
+        !stream->period_frames) {
+        /* Mute: zero out the playback buffers */
+        while (frames) {
+            struct motu_buf *dst_buf = &stream->bufs[stream->copy_pos];
+            unsigned int dst_frames = dst_buf->length - stream->copy_frame;
+            unsigned int frames_this_copy = min(frames, dst_frames);
+            unsigned int bytes_this_copy = frames_this_copy * BYTES_PER_FRAME;
+            unsigned int dst_offset = stream->copy_frame * BYTES_PER_FRAME;
+
+            memset(dst_buf->data + dst_offset, 0, bytes_this_copy);
+
+            frames -= frames_this_copy;
+
+            stream->copy_frame += frames_this_copy;
+            if (stream->copy_frame >= dst_buf->length) {
+                stream->copy_frame = 0;
+                stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
+            }
+        }
+        return;
     }
 
-    inc_frame_position(stream, stream->period_frames);
-    snd_pcm_period_elapsed(stream->substream);
+    src = stream->substream->runtime->dma_area;
+    buffer_size_bytes = stream->period_count * stream->period_frames * BYTES_PER_FRAME;
+
+    if (!src || !buffer_size_bytes)
+        return;
+
+    while (frames) {
+        struct motu_buf *dst_buf = &stream->bufs[stream->copy_pos];
+        unsigned int dst_frames = dst_buf->length - stream->copy_frame;
+        unsigned int frames_this_copy = min(frames, dst_frames);
+        unsigned int bytes_this_copy = frames_this_copy * BYTES_PER_FRAME;
+        unsigned int dst_offset = stream->copy_frame * BYTES_PER_FRAME;
+
+        if (!frames_this_copy)
+            break;
+
+        src_offset = substream_position_bytes(stream);
+        
+        if (src_offset >= buffer_size_bytes) {
+            reset_substream_position(stream);
+            src_offset = 0;
+        }
+
+        /* Copy only up to the end of the buffer; next iteration handles wrap */
+        if ((src_offset + bytes_this_copy) > buffer_size_bytes) {
+            bytes_this_copy = buffer_size_bytes - src_offset;
+            frames_this_copy = bytes_this_copy / BYTES_PER_FRAME;
+        }
+
+        if (bytes_this_copy > 0)
+            memcpy(dst_buf->data + dst_offset, src + src_offset, bytes_this_copy);
+
+        frames -= frames_this_copy;
+
+        stream->copy_frame += frames_this_copy;
+        if (stream->copy_frame >= dst_buf->length) {
+            stream->copy_frame = 0;
+            stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
+        }
+
+        if (inc_frame_position(stream, frames_this_copy))
+            snd_pcm_period_elapsed(stream->substream);
+    }
 }
 
 static void handle_interval_interrupt(struct motu_usb_data *priv)
 {
-    struct motu_stream *rec_stream = &priv->rec_stream;
     struct motu_stream *pb_stream = &priv->pb_stream;
-    unsigned int period_size = priv->interrupt.interval;
-    
-    count_sample_frames(priv);
-    
-    if (rec_stream->copy_pos == TOTAL_UFRAMES) {
-        /* Capture startup - Sync copy position */
-        if (priv->rx_frames < (period_size + REC_SAFETY_OFFSET))
-            return;
-        
-        int discard = priv->rx_frames - (period_size + REC_SAFETY_OFFSET);
-        rec_stream->copy_pos = 0;
 
-        while (discard > 0) {
-            discard -= rec_stream->bufs[rec_stream->copy_pos].length;
-            shred_sample_frames(rec_stream, rec_stream->bufs[rec_stream->copy_pos].data);
-            ++rec_stream->copy_pos;
-        }
-
-        dev_info(&priv->usb->dev, 
-            "Rec Copy Sync: %d (chase: %u, count: %u)\n",
-            rec_stream->copy_pos, priv->chase_pos, priv->rx_frames);
-    }
-    else if (priv->pb_start_state == PB_START_SYNC) {
-        /* Playback startup - Sync copy position */
-        int adjust = (priv->chase_pos + PB_SAFETY_OFFSET) -
-            (UFRAMES_PER_URB * 2);
-        
-        pb_stream->copy_pos = (TOTAL_UFRAMES + adjust) % TOTAL_UFRAMES;
-        priv->pb_start_state = PB_START_RUNNING;
-
-        dev_info(&priv->usb->dev,
-            "PB Copy Sync: %u (adjust: %d chase: %u)\n", 
-            pb_stream->copy_pos, adjust, priv->chase_pos);
-    }
-    else if (priv->pb_adj) {
+    /* Apply any pending playback adjustment */
+    if (priv->pb_adj) {
+        unsigned long flags;
+        spin_lock_irqsave(&pb_stream->lock, flags);
         pb_stream->copy_pos =
             (pb_stream->copy_pos + priv->pb_adj) % TOTAL_UFRAMES;
         priv->pb_adj_total += priv->pb_adj;
         priv->pb_adj = 0;
-    }
-
-    if (rec_stream->copy_pos != TOTAL_UFRAMES) {
-        if (rec_stream->enabled && spin_trylock(&rec_stream->lock)) {
-            copy_period_from_usb(rec_stream, period_size);
-            spin_unlock(&rec_stream->lock);
-        }
-        else {
-            sync_period_from_usb(rec_stream, period_size);
-        }
-    }
-
-    if (priv->pb_start_state == PB_START_RUNNING) {
-        if (pb_stream->enabled && spin_trylock(&pb_stream->lock)) {
-            copy_period_to_usb(pb_stream, period_size);
-            spin_unlock(&pb_stream->lock);
-        }
-        else {
-            mute_period_to_usb(pb_stream, period_size);
-        }
+        spin_unlock_irqrestore(&pb_stream->lock, flags);
     }
 }
 
@@ -541,20 +463,27 @@ static void playback_complete_urb(struct urb *urb)
 static void capture_complete_urb(struct urb *urb)
 {
     struct motu_usb_data *priv = urb->context;
+    struct motu_stream *rec_stream = &priv->rec_stream;
+    struct motu_stream *pb_stream = &priv->pb_stream;
     struct urb *pb_urb;
+    struct motu_buf *rec_bufs;
     struct motu_buf *pb_bufs;
+    unsigned int urb_idx;
+    unsigned int urb_frames = 0;
 
     if (!priv || 
         priv->disconnected || 
         !atomic_read(&priv->streams_started))
         return;
     
-    pb_urb = priv->pb_stream.urbs[priv->urb_idx];
-    pb_bufs = &priv->pb_stream.bufs[priv->urb_idx * UFRAMES_PER_URB];
+    urb_idx = priv->urb_idx;
+    pb_urb = pb_stream->urbs[urb_idx];
+    rec_bufs = &rec_stream->bufs[urb_idx * UFRAMES_PER_URB];
+    pb_bufs = &pb_stream->bufs[urb_idx * UFRAMES_PER_URB];
     priv->urb_idx = (priv->urb_idx + 1) % NUM_URBS;
     
+    /* Use actual_length to determine frame counts directly */
     for (int i = 0; i < UFRAMES_PER_URB; ++i) {
-        /* Nominal Packet Size */
         unsigned int length = BYTES_PER_FRAME * priv->nom_sample_count;
         
         if (!urb->iso_frame_desc[i].status)
@@ -563,22 +492,63 @@ static void capture_complete_urb(struct urb *urb)
             dev_info(&priv->usb->dev, "rec urb error\n");
         
         pb_urb->iso_frame_desc[i].length = length;
+        rec_bufs[i].length = length / BYTES_PER_FRAME;
         pb_bufs[i].length = length / BYTES_PER_FRAME;
+        urb_frames += length / BYTES_PER_FRAME;
     }
 
+    priv->rx_frames += urb_frames;
+
+    /* Resubmit capture URB immediately */
     usb_submit_urb(urb, GFP_ATOMIC);
 
+    /* Capture: copy received audio data to ALSA buffer */
+    if (rec_stream->copy_pos == TOTAL_UFRAMES) {
+        /* Capture startup - wait for enough data */
+        if (priv->rx_frames >= (REC_SAFETY_OFFSET + urb_frames)) {
+            rec_stream->copy_pos = urb_idx * UFRAMES_PER_URB;
+            rec_stream->copy_frame = 0;
+            dev_info(&priv->usb->dev,
+                "Rec Copy Sync: %u (count: %u)\n",
+                rec_stream->copy_pos, priv->rx_frames);
+        }
+    }
+
+    if (rec_stream->copy_pos != TOTAL_UFRAMES) {
+        spin_lock(&rec_stream->lock);
+        copy_frames_from_usb(rec_stream, urb_frames);
+        spin_unlock(&rec_stream->lock);
+    }
+
+    /* Playback: fill outgoing URB from ALSA buffer */
     switch (priv->pb_start_state) {
     case PB_START_IDLE:
         priv->pb_start_state = PB_START_PRIME;
         break;
     case PB_START_PRIME:
-        usb_submit_urb(priv->pb_stream.urbs[0], GFP_ATOMIC);
-        usb_submit_urb(priv->pb_stream.urbs[1], GFP_ATOMIC);
+        /* Pre-fill first two URBs with silent or initial data */
+        spin_lock(&pb_stream->lock);
+        pb_stream->copy_pos = 0;
+        pb_stream->copy_frame = 0;
+        copy_frames_to_usb(pb_stream, UFRAMES_PER_URB);
+        usb_submit_urb(pb_stream->urbs[0], GFP_ATOMIC);
+        copy_frames_to_usb(pb_stream, UFRAMES_PER_URB);
+        usb_submit_urb(pb_stream->urbs[1], GFP_ATOMIC);
+        spin_unlock(&pb_stream->lock);
         priv->pb_start_state = PB_START_SYNC;
         break;
     case PB_START_SYNC:
+        /* Sync playback copy position relative to current capture position */
+        pb_stream->copy_pos = urb_idx * UFRAMES_PER_URB;
+        pb_stream->copy_frame = 0;
+        priv->pb_start_state = PB_START_RUNNING;
+        dev_info(&priv->usb->dev,
+            "PB Copy Sync: %u (idx: %u)\n", pb_stream->copy_pos, urb_idx);
+        fallthrough;
     case PB_START_RUNNING:
+        spin_lock(&pb_stream->lock);
+        copy_frames_to_usb(pb_stream, urb_frames);
+        spin_unlock(&pb_stream->lock);
         usb_submit_urb(pb_urb, GFP_ATOMIC);
         break;
     }
@@ -640,7 +610,6 @@ static void start_streaming_endpoints(struct work_struct *work)
     priv->pb_stream.copy_pos = TOTAL_UFRAMES;
     priv->pb_stream.copy_frame = 0;
     priv->urb_idx = 0;
-    priv->chase_pos = 0;
     priv->rx_frames = 0;
     priv->pb_start_state = PB_START_IDLE;
 
@@ -649,7 +618,7 @@ static void start_streaming_endpoints(struct work_struct *work)
         priv->pb_stream.bufs[i].length = 0;
     }
 
-    for (int i = 0; i < UFRAMES_PER_URB; ++i)
+    for (int i = 0; i < TOTAL_UFRAMES; ++i)
         shred_sample_frames(&priv->rec_stream, priv->rec_stream.bufs[i].data);
 
     set_interrupt_interval(priv, interval);
@@ -696,7 +665,7 @@ static void free_stream_urbs(struct motu_usb_data *priv,
         
         usb_kill_urb(urbs[i]);
         
-        if ((i == 0) && urbs[i]->transfer_buffer)
+        if (urbs[i]->transfer_buffer)
         {
             usb_free_coherent(priv->usb,
                 urbs[i]->transfer_buffer_length,
@@ -739,14 +708,12 @@ static int alloc_stream_urbs(struct motu_usb_data *priv,
         if (!urbs[i])
             goto out_free;
 
-        if (!transfer_buffer) {
-            transfer_buffer = usb_alloc_coherent(priv->usb,
-                                transfer_buffer_length,
-                                GFP_KERNEL, &transfer_dma);
-            
-            if (!transfer_buffer)
-                goto out_free;
-        }
+        transfer_buffer = usb_alloc_coherent(priv->usb,
+                            transfer_buffer_length,
+                            GFP_KERNEL, &transfer_dma);
+        
+        if (!transfer_buffer)
+            goto out_free;
         
         urbs[i]->dev = priv->usb;
         urbs[i]->pipe = pipe;
