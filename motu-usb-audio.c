@@ -836,7 +836,7 @@ static void maybe_queue_stop_streaming(struct snd_pcm_substream *subs)
     spin_lock(&priv->wq_lock);
     if (priv->start_stop_wq)
         queue_delayed_work(priv->start_stop_wq, &priv->stop_streams_work,
-            msecs_to_jiffies(2000));
+            msecs_to_jiffies(100));
     spin_unlock(&priv->wq_lock);
 }
 
@@ -1316,7 +1316,7 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
         spin_lock_init(&priv->pb_stream.lock);
         spin_lock_init(&priv->wq_lock);
 
-        priv->start_stop_wq = alloc_ordered_workqueue("snd_usb_motu_wq", 0);
+        priv->start_stop_wq = alloc_ordered_workqueue("snd_usb_motu_wq", WQ_HIGHPRI);
 
         if (!priv->start_stop_wq ) {
             err = -ENOMEM;
