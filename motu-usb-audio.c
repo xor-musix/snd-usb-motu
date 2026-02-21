@@ -28,14 +28,14 @@ module_param(sample_rate, int, 0644);
 MODULE_PARM_DESC(sample_rate, "Sample rate in Hz (44100, 48000, 88200, 96000, 176400, 192000)");
 
 #define NUM_INTERRUPT_URBS  4
-#define NUM_URBS            32
-#define UFRAMES_PER_URB     8
+#define NUM_URBS            128
+#define UFRAMES_PER_URB     2
 #define TOTAL_UFRAMES       (NUM_URBS * UFRAMES_PER_URB)
 #define NUM_CH              24
 #define BYTES_PER_SAMPLE    3
 #define BYTES_PER_FRAME     (NUM_CH * BYTES_PER_SAMPLE)
-#define PB_SAFETY_OFFSET    16
-#define REC_SAFETY_OFFSET   16
+#define PB_SAFETY_OFFSET    4
+#define REC_SAFETY_OFFSET   4
 
 static inline unsigned int rate_flag(unsigned int sr)
 {
@@ -189,7 +189,7 @@ static struct snd_pcm_hardware snd_motu_hw = {
     .channels_min =     NUM_CH,
     .channels_max =     NUM_CH,
     .buffer_bytes_max = BYTES_PER_FRAME * 2048 * 4,
-    .period_bytes_min = BYTES_PER_FRAME * 32,
+    .period_bytes_min = BYTES_PER_FRAME * 16,
     .period_bytes_max = BYTES_PER_FRAME * 2048,
     .periods_min =      2,
     .periods_max =      16,
@@ -518,14 +518,12 @@ static void capture_complete_urb(struct urb *urb)
         priv->pb_start_state = PB_START_PRIME;
         break;
     case PB_START_PRIME:
-        /* Pre-fill first two URBs with silent or initial data */
+        /* Pre-fill first URB with silent or initial data */
         spin_lock(&pb_stream->lock);
         pb_stream->copy_pos = 0;
         pb_stream->copy_frame = 0;
         copy_frames_to_usb(pb_stream, UFRAMES_PER_URB);
         usb_submit_urb(pb_stream->urbs[0], GFP_ATOMIC);
-        copy_frames_to_usb(pb_stream, UFRAMES_PER_URB);
-        usb_submit_urb(pb_stream->urbs[1], GFP_ATOMIC);
         spin_unlock(&pb_stream->lock);
         priv->pb_start_state = PB_START_SYNC;
         break;
