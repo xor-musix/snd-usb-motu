@@ -142,6 +142,7 @@ struct motu_usb_data
     int pb_adj;
     int pb_adj_total;
     unsigned int zero_frame_count;
+    unsigned int recovery_attempts;
     bool disconnected;
     struct mutex pcm_mutex;
     enum pb_start_state pb_start_state;
@@ -422,14 +423,19 @@ static void copy_frames_to_usb(struct motu_stream *stream, unsigned int frames)
     }
 }
 
-static void handle_status_interrupt(struct motu_interrupt_msg *msg,
+#define MAX_RECOVERY_ATTEMPTS 3
+
+static void restart_streaming_endpoints(struct motu_usb_data *priv);
+
+static void handle_status_interrupt(struct class_interrupt_msg *msg,
     struct motu_usb_data *priv)
 {
-    /*
     dev_info(&priv->usb->dev,
-        "info:%u attr:%u cn:%u cs:%u intf:%u id:%u\n",
+        "status: info:0x%02x attr:0x%02x cn:%u cs:%u intf:%u id:%u\n",
         msg->info, msg->attr, msg->cn, msg->cs, msg->intf, msg->id);
-    */
+
+    if (atomic_read(&priv->streams_started))
+        restart_streaming_endpoints(priv);
 }
 
 static void interrupt_complete_urb(struct urb* urb)
@@ -510,18 +516,33 @@ static void capture_complete_urb(struct urb *urb)
     if (urb_frames == 0) {
         priv->zero_frame_count++;
         if (priv->zero_frame_count >= priv->rt_num_urbs) {
-            dev_info(&priv->usb->dev,
-                "Clock instability: %u consecutive zero-frame URBs, signaling xrun\n",
-                priv->zero_frame_count);
             priv->zero_frame_count = 0;
-            schedule_work(&priv->xrun_work);
+
+            if (priv->recovery_attempts < MAX_RECOVERY_ATTEMPTS) {
+                priv->recovery_attempts++;
+                dev_warn(&priv->usb->dev,
+                    "Clock loss detected, recovery attempt %u/%u\n",
+                    priv->recovery_attempts, MAX_RECOVERY_ATTEMPTS);
+                restart_streaming_endpoints(priv);
+            } else {
+                dev_err(&priv->usb->dev,
+                    "Clock loss: recovery failed after %u attempts, signaling xrun\n",
+                    MAX_RECOVERY_ATTEMPTS);
+                priv->recovery_attempts = 0;
+                schedule_work(&priv->xrun_work);
+            }
         }
     } else {
         priv->zero_frame_count = 0;
+        priv->recovery_attempts = 0;
     }
 
     /* Resubmit capture URB immediately */
-    usb_submit_urb(urb, GFP_ATOMIC);
+    if (usb_submit_urb(urb, GFP_ATOMIC) < 0) {
+        dev_err(&priv->usb->dev, "Capture URB resubmit failed\n");
+        schedule_work(&priv->xrun_work);
+        return;
+    }
 
     /* Capture: copy received audio data to ALSA buffer */
     if (rec_stream->copy_pos == priv->rt_total_uframes) {
@@ -585,7 +606,10 @@ static void capture_complete_urb(struct urb *urb)
         spin_lock(&pb_stream->lock);
         copy_frames_to_usb(pb_stream, urb_frames);
         spin_unlock(&pb_stream->lock);
-        usb_submit_urb(pb_urb, GFP_ATOMIC);
+        if (usb_submit_urb(pb_urb, GFP_ATOMIC) < 0) {
+            dev_err(&priv->usb->dev, "Playback URB submit failed\n");
+            schedule_work(&priv->xrun_work);
+        }
         break;
     }
 }
@@ -648,6 +672,7 @@ static void start_streaming_endpoints(struct work_struct *work)
     priv->urb_idx = 0;
     priv->rx_frames = 0;
     priv->zero_frame_count = 0;
+    priv->recovery_attempts = 0;
     priv->pb_start_state = PB_START_IDLE;
 
     for (int i = 0; i < priv->rt_total_uframes; ++i) {
