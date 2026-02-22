@@ -7,6 +7,7 @@
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/usb.h>
+#include <linux/timer.h>
 #include <linux/workqueue.h>
 #include <sound/core.h>
 #include <sound/info.h>
@@ -41,6 +42,8 @@ MODULE_PARM_DESC(uframes_per_urb,
 #define BYTES_PER_FRAME     (NUM_CH * BYTES_PER_SAMPLE)
 #define PB_SAFETY_OFFSET    4
 #define REC_SAFETY_OFFSET   4
+#define HEALTH_CHECK_MS     500
+#define HEALTH_STALL_LIMIT  3
 
 static inline unsigned int rate_flag(unsigned int sr)
 {
@@ -145,6 +148,9 @@ struct motu_usb_data
     unsigned int zero_frame_count;
     unsigned int recovery_attempts;
     bool disconnected;
+    struct timer_list health_timer;
+    unsigned int last_health_rx_frames;
+    unsigned int health_stall_count;
     struct mutex pcm_mutex;
     enum pb_start_state pb_start_state;
     /* Runtime sample-rate state */
@@ -491,6 +497,17 @@ static void capture_complete_urb(struct urb *urb)
         priv->disconnected || 
         !atomic_read(&priv->streams_started))
         return;
+
+    /* Handle URB-level errors */
+    if (urb->status != 0) {
+        if (urb->status == -ENOENT || urb->status == -ECONNRESET ||
+            urb->status == -ESHUTDOWN)
+            return;  /* URB was killed, don't resubmit */
+        dev_warn(&priv->usb->dev, "Capture URB error: %d\n", urb->status);
+        /* Resubmit but don't process bad data */
+        usb_submit_urb(urb, GFP_ATOMIC);
+        return;
+    }
     
     urb_idx = priv->urb_idx;
     pb_urb = pb_stream->urbs[urb_idx];
@@ -639,6 +656,34 @@ static void set_interrupt_interval(struct motu_usb_data *priv, u16 interval)
             "Failed to set interrupt interval: %d\n", ret);
 }
 
+static void health_timer_fn(struct timer_list *t)
+{
+    struct motu_usb_data *priv = container_of(t, struct motu_usb_data, health_timer);
+
+    if (!atomic_read(&priv->streams_started) || priv->disconnected)
+        return;
+
+    if (priv->rx_frames == priv->last_health_rx_frames &&
+        priv->rx_frames > 0) {
+        priv->health_stall_count++;
+        dev_warn(&priv->usb->dev,
+            "Health: no progress for %u checks (rx_frames=%u)\n",
+            priv->health_stall_count, priv->rx_frames);
+        if (priv->health_stall_count >= HEALTH_STALL_LIMIT) {
+            priv->health_stall_count = 0;
+            dev_err(&priv->usb->dev,
+                "Health: stream stalled, restarting\n");
+            restart_streaming_endpoints(priv);
+            return;
+        }
+    } else {
+        priv->health_stall_count = 0;
+    }
+    priv->last_health_rx_frames = priv->rx_frames;
+
+    mod_timer(&priv->health_timer, jiffies + msecs_to_jiffies(HEALTH_CHECK_MS));
+}
+
 static void restart_streams_work_fn(struct work_struct *work)
 {
     struct motu_usb_data *priv =
@@ -704,8 +749,13 @@ static void start_streaming_endpoints(struct work_struct *work)
     usb_set_interface(priv->usb, 2, 1); // start record
     usb_set_interface(priv->usb, 1, 1); // start playback
 
+    priv->last_health_rx_frames = 0;
+    priv->health_stall_count = 0;
+
     for (int i = 0; i < priv->rt_num_urbs; ++i)
         usb_submit_urb(urbs[i], GFP_ATOMIC);
+
+    mod_timer(&priv->health_timer, jiffies + msecs_to_jiffies(HEALTH_CHECK_MS));
 }
 
 static void stop_streaming_endpoints(struct work_struct *work)
@@ -717,6 +767,8 @@ static void stop_streaming_endpoints(struct work_struct *work)
     if (!atomic_cmpxchg(&priv->streams_started, 1, 0))
        return;
     
+    timer_delete_sync(&priv->health_timer);
+
     dev_info(&priv->usb->dev, "stop_streaming_endpoints\n");
 
     priv->pb_adj_total = 0;
@@ -1435,6 +1487,7 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
         INIT_DELAYED_WORK(&priv->stop_streams_work, stop_streaming_endpoints);
         INIT_WORK(&priv->restart_streams_work, restart_streams_work_fn);
         INIT_WORK(&priv->xrun_work, xrun_work_fn);
+        timer_setup(&priv->health_timer, health_timer_fn, 0);
 
         strcpy(card->driver, "MOTU Driver");
         strcpy(card->shortname, "MOTU Pro Audio");
@@ -1474,6 +1527,7 @@ static void motu_usb_audio_disconnect(struct usb_interface *intf)
         struct workqueue_struct *wq = priv->start_stop_wq;
         dev_info(&dev->dev, "Disconnect: Freeing Card\n");
         priv->disconnected = true;
+        timer_delete_sync(&priv->health_timer);
         snd_card_disconnect(priv->card);
         spin_lock(&priv->wq_lock);
         priv->start_stop_wq = NULL;
