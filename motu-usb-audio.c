@@ -133,6 +133,7 @@ struct motu_usb_data
     struct workqueue_struct *start_stop_wq;
     struct delayed_work start_streams_work;
     struct delayed_work stop_streams_work;
+    struct work_struct restart_streams_work;
     struct work_struct xrun_work;
     struct motu_interrupt interrupt;
     struct motu_stream rec_stream;
@@ -426,6 +427,8 @@ static void copy_frames_to_usb(struct motu_stream *stream, unsigned int frames)
 #define MAX_RECOVERY_ATTEMPTS 3
 
 static void restart_streaming_endpoints(struct motu_usb_data *priv);
+static void start_streaming_endpoints(struct work_struct *work);
+static void stop_streaming_endpoints(struct work_struct *work);
 
 static void handle_status_interrupt(struct class_interrupt_msg *msg,
     struct motu_usb_data *priv)
@@ -590,7 +593,12 @@ static void capture_complete_urb(struct urb *urb)
         pb_stream->copy_pos = 0;
         pb_stream->copy_frame = 0;
         copy_frames_to_usb(pb_stream, priv->rt_uframes_per_urb);
-        usb_submit_urb(pb_stream->urbs[0], GFP_ATOMIC);
+        if (usb_submit_urb(pb_stream->urbs[0], GFP_ATOMIC) < 0) {
+            spin_unlock(&pb_stream->lock);
+            dev_err(&priv->usb->dev, "PB Prime URB submit failed\n");
+            schedule_work(&priv->xrun_work);
+            return;
+        }
         spin_unlock(&pb_stream->lock);
         priv->pb_start_state = PB_START_SYNC;
         break;
@@ -631,16 +639,25 @@ static void set_interrupt_interval(struct motu_usb_data *priv, u16 interval)
             "Failed to set interrupt interval: %d\n", ret);
 }
 
+static void restart_streams_work_fn(struct work_struct *work)
+{
+    struct motu_usb_data *priv =
+        container_of(work, struct motu_usb_data, restart_streams_work);
+
+    /* Ensure stop completes fully before restarting */
+    cancel_delayed_work_sync(&priv->start_streams_work);
+    cancel_delayed_work_sync(&priv->stop_streams_work);
+
+    stop_streaming_endpoints(&priv->stop_streams_work.work);
+    start_streaming_endpoints(&priv->start_streams_work.work);
+}
+
 static void restart_streaming_endpoints(struct motu_usb_data *priv)
 {
     spin_lock(&priv->wq_lock);
 
-    if (priv->start_stop_wq) {
-        queue_delayed_work(priv->start_stop_wq,
-            &priv->stop_streams_work, 0);
-        queue_delayed_work(priv->start_stop_wq,
-            &priv->start_streams_work, msecs_to_jiffies(1));
-    }
+    if (priv->start_stop_wq)
+        queue_work(priv->start_stop_wq, &priv->restart_streams_work);
 
     spin_unlock(&priv->wq_lock);
 }
@@ -1416,6 +1433,7 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
 
         INIT_DELAYED_WORK(&priv->start_streams_work, start_streaming_endpoints);
         INIT_DELAYED_WORK(&priv->stop_streams_work, stop_streaming_endpoints);
+        INIT_WORK(&priv->restart_streams_work, restart_streams_work_fn);
         INIT_WORK(&priv->xrun_work, xrun_work_fn);
 
         strcpy(card->driver, "MOTU Driver");
@@ -1462,6 +1480,7 @@ static void motu_usb_audio_disconnect(struct usb_interface *intf)
         spin_unlock(&priv->wq_lock);
         cancel_delayed_work_sync(&priv->start_streams_work);
         cancel_delayed_work_sync(&priv->stop_streams_work);
+        cancel_work_sync(&priv->restart_streams_work);
         cancel_work_sync(&priv->xrun_work);
         destroy_workqueue(wq);
         atomic_set(&priv->streams_started, 0);
