@@ -439,7 +439,7 @@ static void stop_streaming_endpoints(struct work_struct *work);
 static void handle_status_interrupt(struct class_interrupt_msg *msg,
     struct motu_usb_data *priv)
 {
-    dev_info(&priv->usb->dev,
+    dev_info_ratelimited(&priv->usb->dev,
         "status: info:0x%02x attr:0x%02x cn:%u cs:%u intf:%u id:%u\n",
         msg->info, msg->attr, msg->cn, msg->cs, msg->intf, msg->id);
 
@@ -456,8 +456,10 @@ static void interrupt_complete_urb(struct urb* urb)
         return;
 
     if (urb->status == 0) {
-        if (!(msg->info == 0x01 && msg->attr == 0x01))
-            handle_status_interrupt(urb->transfer_buffer, priv);
+        handle_status_interrupt(urb->transfer_buffer, priv);
+    } else {
+        dev_warn_ratelimited(&priv->usb->dev,
+            "Interrupt URB error status: %d\n", urb->status);
     }
 
     usb_submit_urb(urb, GFP_ATOMIC);
@@ -465,10 +467,10 @@ static void interrupt_complete_urb(struct urb* urb)
 
 static void playback_complete_urb(struct urb *urb)
 {
-    /*
     struct motu_usb_data *priv = urb->context;
-    dev_info(&priv->usb->dev, "copy_pos:%u\n", priv->pb_stream.copy_pos);
-    */
+    dev_info_ratelimited(&priv->usb->dev,
+        "PB URB complete status:%d copy_pos:%u\n",
+        urb->status, priv->pb_stream.copy_pos);
 }
 
 static void xrun_work_fn(struct work_struct *work)
@@ -531,6 +533,10 @@ static void capture_complete_urb(struct urb *urb)
     }
 
     priv->rx_frames += urb_frames;
+
+    dev_info_ratelimited(&priv->usb->dev,
+        "CAP URB idx:%u frames:%u rx_total:%u status:%d\n",
+        urb_idx, urb_frames, priv->rx_frames, urb->status);
 
     /* Zero-frame watchdog: detect clock instability */
     if (urb_frames == 0) {
