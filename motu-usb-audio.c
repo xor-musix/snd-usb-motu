@@ -36,10 +36,6 @@ MODULE_PARM_DESC(sample_rate, "Sample rate in Hz (44100, 48000, 88200, 96000, 17
 #define PB_SAFETY_OFFSET    16
 #define REC_SAFETY_OFFSET   16
 
-/* Derived at runtime from selected sample_rate (legacy global no longer used).
- * Use priv->nom_sample_count instead.
- */
-
 static inline unsigned int rate_flag(unsigned int sr)
 {
     switch (sr) {
@@ -71,8 +67,6 @@ static inline int compute_nom_sample_count(unsigned int sr)
         return -EINVAL;
     }
 }
-
-/* set_runtime_rate is defined after struct motu_usb_data to ensure full type visibility */
 
 /* Mask of all supported rates for initial hw template; narrowed at open() */
 #define SUPPORTED_RATES_MASK ( \
@@ -155,11 +149,6 @@ struct motu_interrupt_msg
     unsigned int frame;
 } __attribute__((packed));
 
-/*
- * Now that struct motu_usb_data is fully defined, provide the implementation
- * of set_runtime_rate(). This was previously placed too early, causing an
- * incomplete type error when accessing fields of motu_usb_data.
- */
 static int set_runtime_rate(struct motu_usb_data *priv, unsigned int rate)
 {
     int nsc;
