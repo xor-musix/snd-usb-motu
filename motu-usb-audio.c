@@ -133,6 +133,7 @@ struct motu_usb_data
     struct workqueue_struct *start_stop_wq;
     struct delayed_work start_streams_work;
     struct delayed_work stop_streams_work;
+    struct work_struct xrun_work;
     struct motu_interrupt interrupt;
     struct motu_stream rec_stream;
     struct motu_stream pb_stream;
@@ -140,6 +141,7 @@ struct motu_usb_data
     unsigned int rx_frames;
     int pb_adj;
     int pb_adj_total;
+    unsigned int zero_frame_count;
     bool disconnected;
     struct mutex pcm_mutex;
     enum pb_start_state pb_start_state;
@@ -454,6 +456,17 @@ static void playback_complete_urb(struct urb *urb)
     */
 }
 
+static void xrun_work_fn(struct work_struct *work)
+{
+    struct motu_usb_data *priv =
+        container_of(work, struct motu_usb_data, xrun_work);
+
+    if (priv->rec_stream.substream)
+        snd_pcm_stop_xrun(priv->rec_stream.substream);
+    if (priv->pb_stream.substream)
+        snd_pcm_stop_xrun(priv->pb_stream.substream);
+}
+
 static void capture_complete_urb(struct urb *urb)
 {
     struct motu_usb_data *priv = urb->context;
@@ -493,6 +506,20 @@ static void capture_complete_urb(struct urb *urb)
 
     priv->rx_frames += urb_frames;
 
+    /* Zero-frame watchdog: detect clock instability */
+    if (urb_frames == 0) {
+        priv->zero_frame_count++;
+        if (priv->zero_frame_count >= priv->rt_num_urbs) {
+            dev_info(&priv->usb->dev,
+                "Clock instability: %u consecutive zero-frame URBs, signaling xrun\n",
+                priv->zero_frame_count);
+            priv->zero_frame_count = 0;
+            schedule_work(&priv->xrun_work);
+        }
+    } else {
+        priv->zero_frame_count = 0;
+    }
+
     /* Resubmit capture URB immediately */
     usb_submit_urb(urb, GFP_ATOMIC);
 
@@ -530,7 +557,14 @@ static void capture_complete_urb(struct urb *urb)
         priv->pb_start_state = PB_START_PRIME;
         break;
     case PB_START_PRIME:
-        /* Pre-fill first URB with silent or initial data */
+        /* Pre-fill all playback URBs with silence before first submit */
+        for (int i = 0; i < priv->rt_num_urbs; ++i) {
+            struct urb *u = pb_stream->urbs[i];
+            if (u && u->transfer_buffer)
+                memset(u->transfer_buffer, 0, u->transfer_buffer_length);
+        }
+        dev_info(&priv->usb->dev,
+            "PB Prime: prefilled %u URBs with silence\n", priv->rt_num_urbs);
         spin_lock(&pb_stream->lock);
         pb_stream->copy_pos = 0;
         pb_stream->copy_frame = 0;
@@ -613,6 +647,7 @@ static void start_streaming_endpoints(struct work_struct *work)
     priv->pb_stream.copy_frame = 0;
     priv->urb_idx = 0;
     priv->rx_frames = 0;
+    priv->zero_frame_count = 0;
     priv->pb_start_state = PB_START_IDLE;
 
     for (int i = 0; i < priv->rt_total_uframes; ++i) {
@@ -1355,6 +1390,7 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
 
         INIT_DELAYED_WORK(&priv->start_streams_work, start_streaming_endpoints);
         INIT_DELAYED_WORK(&priv->stop_streams_work, stop_streaming_endpoints);
+        INIT_WORK(&priv->xrun_work, xrun_work_fn);
 
         strcpy(card->driver, "MOTU Driver");
         strcpy(card->shortname, "MOTU Pro Audio");
@@ -1400,6 +1436,7 @@ static void motu_usb_audio_disconnect(struct usb_interface *intf)
         spin_unlock(&priv->wq_lock);
         cancel_delayed_work_sync(&priv->start_streams_work);
         cancel_delayed_work_sync(&priv->stop_streams_work);
+        cancel_work_sync(&priv->xrun_work);
         destroy_workqueue(wq);
         atomic_set(&priv->streams_started, 0);
         free_interrupt_ubs(priv);
