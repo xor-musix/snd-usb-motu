@@ -28,6 +28,7 @@ Currently **only USB 2.0 models** are supported:
 - **Audio streaming only**
 - Control/configuration must be done via the device’s web UI over Ethernet
 - Default sample rate is 48 kHz, configurable at module load via `sample_rate=<Hz>`
+- `uframes_per_urb=<N>` — number of USB microframes packed into each URB (valid: 1, 2, 4, 8, 16, 32; default: **8**). Lower values reduce latency; higher values reduce CPU overhead. The driver maintains a fixed total of 256 microframes, so the URB count is `256 / uframes_per_urb`
 - Runtime sample-rate changes are supported via ALSA `hw_params` (e.g., `aplay -r 96000`). The driver stops, reconfigures, and restarts USB streams automatically when the app requests a different supported rate
 - Device clock must already be configured/locked to the requested rate. Clock source and rate are not changed by the driver. If the hardware isn't locked to the requested rate, audio may fail to start or underrun/overrun
 - Debug logging (`sudo dmesg -w` to view)
