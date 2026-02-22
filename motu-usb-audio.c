@@ -30,11 +30,11 @@ MODULE_PARM_DESC(sample_rate, "Sample rate in Hz (44100, 48000, 88200, 96000, 17
 static unsigned int uframes_per_urb = 8;
 module_param(uframes_per_urb, uint, 0444);
 MODULE_PARM_DESC(uframes_per_urb,
-    "Microframes per URB (1,2,4,8). Lower=less latency, higher=less CPU. Default: 8");
+    "Microframes per URB (1,2,4,8,16,32). Lower=less latency, higher=less CPU. Default: 8");
 
 #define NUM_INTERRUPT_URBS  4
 #define MAX_NUM_URBS        256
-#define MAX_UFRAMES_PER_URB 8
+#define MAX_UFRAMES_PER_URB 32
 #define MAX_TOTAL_UFRAMES   256
 #define NUM_CH              24
 #define BYTES_PER_SAMPLE    3
@@ -1335,7 +1335,8 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
 
         /* Validate and apply USB scheduling module parameter */
         if (uframes_per_urb != 1 && uframes_per_urb != 2 &&
-            uframes_per_urb != 4 && uframes_per_urb != 8) {
+            uframes_per_urb != 4 && uframes_per_urb != 8 &&
+            uframes_per_urb != 16 && uframes_per_urb != 32) {
             dev_warn(&dev->dev,
                 "Invalid uframes_per_urb=%u, clamping to 8\n",
                 uframes_per_urb);
