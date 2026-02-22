@@ -27,10 +27,15 @@ static int sample_rate = 48000;
 module_param(sample_rate, int, 0644);
 MODULE_PARM_DESC(sample_rate, "Sample rate in Hz (44100, 48000, 88200, 96000, 176400, 192000)");
 
+static unsigned int uframes_per_urb = 2;
+module_param(uframes_per_urb, uint, 0444);
+MODULE_PARM_DESC(uframes_per_urb,
+    "Microframes per URB (1,2,4,8). Lower=less latency, higher=less CPU. Default: 2");
+
 #define NUM_INTERRUPT_URBS  4
-#define NUM_URBS            128
-#define UFRAMES_PER_URB     2
-#define TOTAL_UFRAMES       (NUM_URBS * UFRAMES_PER_URB)
+#define MAX_NUM_URBS        256
+#define MAX_UFRAMES_PER_URB 8
+#define MAX_TOTAL_UFRAMES   256
 #define NUM_CH              24
 #define BYTES_PER_SAMPLE    3
 #define BYTES_PER_FRAME     (NUM_CH * BYTES_PER_SAMPLE)
@@ -109,8 +114,8 @@ struct motu_stream
     unsigned int max_packet_size;
     unsigned int copy_pos;
     unsigned int copy_frame;
-    struct motu_buf bufs[TOTAL_UFRAMES];
-    struct urb *urbs[NUM_URBS];
+    struct motu_buf bufs[MAX_TOTAL_UFRAMES];
+    struct urb *urbs[MAX_NUM_URBS];
 };
 
 struct motu_interrupt
@@ -141,6 +146,13 @@ struct motu_usb_data
     /* Runtime sample-rate state */
     unsigned int cur_rate;        /* 0 until set; in Hz */
     int nom_sample_count;         /* derived from cur_rate */
+    /* Runtime USB scheduling parameters (from module param) */
+    unsigned int rt_uframes_per_urb;
+    unsigned int rt_num_urbs;
+    unsigned int rt_num_urbs_mask;
+    unsigned int rt_total_uframes;
+    unsigned int rt_total_uframes_mask;
+    unsigned int rt_rec_safety_offset;
 };
 
 struct motu_interrupt_msg
@@ -318,7 +330,7 @@ static void copy_frames_from_usb(struct motu_stream *stream, unsigned int frames
         stream->copy_frame += frames_this_copy;
         if (stream->copy_frame >= src_buf->length) {
             stream->copy_frame = 0;
-            stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
+            stream->copy_pos = (stream->copy_pos + 1) & stream->owner->rt_total_uframes_mask;
         }
 
         if (inc_frame_position(stream, frames_this_copy))
@@ -357,7 +369,7 @@ static void copy_frames_to_usb(struct motu_stream *stream, unsigned int frames)
             stream->copy_frame += frames_this_copy;
             if (stream->copy_frame >= dst_buf->length) {
                 stream->copy_frame = 0;
-                stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
+                stream->copy_pos = (stream->copy_pos + 1) & stream->owner->rt_total_uframes_mask;
             }
         }
         return;
@@ -400,7 +412,7 @@ static void copy_frames_to_usb(struct motu_stream *stream, unsigned int frames)
         stream->copy_frame += frames_this_copy;
         if (stream->copy_frame >= dst_buf->length) {
             stream->copy_frame = 0;
-            stream->copy_pos = (stream->copy_pos + 1) % TOTAL_UFRAMES;
+            stream->copy_pos = (stream->copy_pos + 1) & stream->owner->rt_total_uframes_mask;
         }
 
         if (inc_frame_position(stream, frames_this_copy))
@@ -460,12 +472,12 @@ static void capture_complete_urb(struct urb *urb)
     
     urb_idx = priv->urb_idx;
     pb_urb = pb_stream->urbs[urb_idx];
-    rec_bufs = &rec_stream->bufs[urb_idx * UFRAMES_PER_URB];
-    pb_bufs = &pb_stream->bufs[urb_idx * UFRAMES_PER_URB];
-    priv->urb_idx = (priv->urb_idx + 1) % NUM_URBS;
+    rec_bufs = &rec_stream->bufs[urb_idx * priv->rt_uframes_per_urb];
+    pb_bufs = &pb_stream->bufs[urb_idx * priv->rt_uframes_per_urb];
+    priv->urb_idx = (priv->urb_idx + 1) & priv->rt_num_urbs_mask;
     
     /* Use actual_length to determine frame counts directly */
-    for (int i = 0; i < UFRAMES_PER_URB; ++i) {
+    for (int i = 0; i < priv->rt_uframes_per_urb; ++i) {
         unsigned int length = BYTES_PER_FRAME * priv->nom_sample_count;
         
         if (!urb->iso_frame_desc[i].status)
@@ -485,10 +497,10 @@ static void capture_complete_urb(struct urb *urb)
     usb_submit_urb(urb, GFP_ATOMIC);
 
     /* Capture: copy received audio data to ALSA buffer */
-    if (rec_stream->copy_pos == TOTAL_UFRAMES) {
+    if (rec_stream->copy_pos == priv->rt_total_uframes) {
         /* Capture startup - wait for enough data */
-        if (priv->rx_frames >= (REC_SAFETY_OFFSET + urb_frames)) {
-            rec_stream->copy_pos = urb_idx * UFRAMES_PER_URB;
+        if (priv->rx_frames >= (priv->rt_rec_safety_offset + urb_frames)) {
+            rec_stream->copy_pos = urb_idx * priv->rt_uframes_per_urb;
             rec_stream->copy_frame = 0;
             dev_info(&priv->usb->dev,
                 "Rec Copy Sync: %u (count: %u)\n",
@@ -496,7 +508,7 @@ static void capture_complete_urb(struct urb *urb)
         }
     }
 
-    if (rec_stream->copy_pos != TOTAL_UFRAMES) {
+    if (rec_stream->copy_pos != priv->rt_total_uframes) {
         spin_lock(&rec_stream->lock);
         copy_frames_from_usb(rec_stream, urb_frames);
         spin_unlock(&rec_stream->lock);
@@ -506,7 +518,7 @@ static void capture_complete_urb(struct urb *urb)
     if (priv->pb_adj) {
         spin_lock(&pb_stream->lock);
         pb_stream->copy_pos =
-            (pb_stream->copy_pos + priv->pb_adj) % TOTAL_UFRAMES;
+            (pb_stream->copy_pos + priv->pb_adj) & priv->rt_total_uframes_mask;
         priv->pb_adj_total += priv->pb_adj;
         priv->pb_adj = 0;
         spin_unlock(&pb_stream->lock);
@@ -522,14 +534,14 @@ static void capture_complete_urb(struct urb *urb)
         spin_lock(&pb_stream->lock);
         pb_stream->copy_pos = 0;
         pb_stream->copy_frame = 0;
-        copy_frames_to_usb(pb_stream, UFRAMES_PER_URB);
+        copy_frames_to_usb(pb_stream, priv->rt_uframes_per_urb);
         usb_submit_urb(pb_stream->urbs[0], GFP_ATOMIC);
         spin_unlock(&pb_stream->lock);
         priv->pb_start_state = PB_START_SYNC;
         break;
     case PB_START_SYNC:
         /* Sync playback copy position relative to current capture position */
-        pb_stream->copy_pos = urb_idx * UFRAMES_PER_URB;
+        pb_stream->copy_pos = urb_idx * priv->rt_uframes_per_urb;
         pb_stream->copy_frame = 0;
         priv->pb_start_state = PB_START_RUNNING;
         dev_info(&priv->usb->dev,
@@ -595,27 +607,27 @@ static void start_streaming_endpoints(struct work_struct *work)
     
     urbs = priv->rec_stream.urbs;
 
-    priv->rec_stream.copy_pos = TOTAL_UFRAMES;
+    priv->rec_stream.copy_pos = priv->rt_total_uframes;
     priv->rec_stream.copy_frame = 0;
-    priv->pb_stream.copy_pos = TOTAL_UFRAMES;
+    priv->pb_stream.copy_pos = priv->rt_total_uframes;
     priv->pb_stream.copy_frame = 0;
     priv->urb_idx = 0;
     priv->rx_frames = 0;
     priv->pb_start_state = PB_START_IDLE;
 
-    for (int i = 0; i < TOTAL_UFRAMES; ++i) {
+    for (int i = 0; i < priv->rt_total_uframes; ++i) {
         priv->rec_stream.bufs[i].length = 0;
         priv->pb_stream.bufs[i].length = 0;
     }
 
-    for (int i = 0; i < TOTAL_UFRAMES; ++i)
+    for (int i = 0; i < priv->rt_total_uframes; ++i)
         shred_sample_frames(&priv->rec_stream, priv->rec_stream.bufs[i].data);
 
     set_interrupt_interval(priv, 1);
     usb_set_interface(priv->usb, 2, 1); // start record
     usb_set_interface(priv->usb, 1, 1); // start playback
 
-    for (int i = 0; i < NUM_URBS; ++i)
+    for (int i = 0; i < priv->rt_num_urbs; ++i)
         usb_submit_urb(urbs[i], GFP_ATOMIC);
 }
 
@@ -634,7 +646,7 @@ static void stop_streaming_endpoints(struct work_struct *work)
 
     set_interrupt_interval(priv, 0);
 
-    for (int i = 0; i < NUM_URBS; ++i) {
+    for (int i = 0; i < priv->rt_num_urbs; ++i) {
         usb_kill_urb(priv->rec_stream.urbs[i]);
         usb_kill_urb(priv->pb_stream.urbs[i]);
     }
@@ -648,7 +660,7 @@ static void free_stream_urbs(struct motu_usb_data *priv,
 {
     struct urb **urbs = stream->urbs;
 
-    for (int i = 0; i < NUM_URBS; ++i) {
+    for (int i = 0; i < MAX_NUM_URBS; ++i) {
         
         if (!urbs[i])
             continue;
@@ -688,12 +700,12 @@ static int alloc_stream_urbs(struct motu_usb_data *priv,
         pipe = usb_sndisocpipe(priv->usb, usb_endpoint_num(epd));
     
     max_packet_size = usb_endpoint_maxp(epd) * usb_endpoint_maxp_mult(epd);
-    transfer_buffer_length = max_packet_size * UFRAMES_PER_URB;
+    transfer_buffer_length = max_packet_size * priv->rt_uframes_per_urb;
 
-    for (int i = 0; i < NUM_URBS; ++i) {
+    for (int i = 0; i < priv->rt_num_urbs; ++i) {
         unsigned int buf_base;
 
-        urbs[i] = usb_alloc_urb(UFRAMES_PER_URB, GFP_KERNEL);
+        urbs[i] = usb_alloc_urb(priv->rt_uframes_per_urb, GFP_KERNEL);
         
         if (!urbs[i])
             goto out_free;
@@ -710,15 +722,15 @@ static int alloc_stream_urbs(struct motu_usb_data *priv,
         urbs[i]->transfer_flags = URB_NO_TRANSFER_DMA_MAP | URB_ISO_ASAP;
         urbs[i]->transfer_buffer = transfer_buffer;
         urbs[i]->transfer_dma = transfer_dma;
-        urbs[i]->transfer_buffer_length = max_packet_size * UFRAMES_PER_URB;
-        urbs[i]->number_of_packets = UFRAMES_PER_URB;
+        urbs[i]->transfer_buffer_length = max_packet_size * priv->rt_uframes_per_urb;
+        urbs[i]->number_of_packets = priv->rt_uframes_per_urb;
         urbs[i]->interval = 1;
         urbs[i]->context = priv;
         urbs[i]->complete = completion_handler;
 
-        buf_base = i * UFRAMES_PER_URB;
+        buf_base = i * priv->rt_uframes_per_urb;
 
-        for (int f = 0; f < UFRAMES_PER_URB; ++f) {
+        for (int f = 0; f < priv->rt_uframes_per_urb; ++f) {
             unsigned int offset = max_packet_size * f;
 
             urbs[i]->iso_frame_desc[f].offset = offset;
@@ -849,6 +861,16 @@ static int capture_pcm_open(struct snd_pcm_substream *subs)
 
     subs->runtime->hw = snd_motu_hw;
 
+    /* Enforce minimum period size based on USB scheduling granularity.
+     * Use worst-case nom_sample_count (24 for 192kHz) if rate not yet set. */
+    {
+        unsigned int nsc = priv->nom_sample_count ? priv->nom_sample_count : 24;
+        unsigned int min_period = priv->rt_uframes_per_urb * nsc;
+        snd_pcm_hw_constraint_minmax(subs->runtime,
+            SNDRV_PCM_HW_PARAM_PERIOD_SIZE, min_period, 2048);
+        dev_info(&priv->usb->dev, "min period size set to %u \n", min_period);
+    }
+
     spin_lock(&priv->rec_stream.lock);
     priv->rec_stream.substream = subs;
     priv->rec_stream.period_frames = 0;
@@ -924,32 +946,13 @@ static int capture_pcm_hw_free(struct snd_pcm_substream *subs)
 {
     struct motu_usb_data *priv = subs->private_data;
 
-    dev_info(&priv->usb->dev,
-         "DEBUG: capture_pcm_hw_free() invoked (disconnected=%d, streams_started=%d)\n",
-         priv->disconnected,
-         atomic_read(&priv->streams_started));
-
-    if (priv->disconnected)
-        return 0;
-
     dev_info(&priv->usb->dev, "capture_pcm_hw_free\n");
-
-    mutex_lock(&priv->pcm_mutex);
 
     spin_lock(&priv->rec_stream.lock);
     priv->rec_stream.period_frames = 0;
     spin_unlock(&priv->rec_stream.lock);
 
     priv->rec_stream.enabled = false;
-
-    cancel_delayed_work_sync(&priv->start_streams_work);
-    cancel_delayed_work_sync(&priv->stop_streams_work);
-
-    /* Ensure URBs are stopped before ALSA teardown continues */
-    stop_streaming_endpoints(&priv->stop_streams_work.work);
-
-    mutex_unlock(&priv->pcm_mutex);
-
     maybe_queue_stop_streaming(subs);
 
     return 0;
@@ -1022,6 +1025,16 @@ static int playback_pcm_open(struct snd_pcm_substream *subs)
     dev_info(&priv->usb->dev, "playback_pcm_open\n");
 
     subs->runtime->hw = snd_motu_hw;
+
+    /* Enforce minimum period size based on USB scheduling granularity.
+     * Use worst-case nom_sample_count (24 for 192kHz) if rate not yet set. */
+    {
+        unsigned int nsc = priv->nom_sample_count ? priv->nom_sample_count : 24;
+        unsigned int min_period = priv->rt_uframes_per_urb * nsc;
+        snd_pcm_hw_constraint_minmax(subs->runtime,
+            SNDRV_PCM_HW_PARAM_PERIOD_SIZE, min_period, 2048);
+        dev_info(&priv->usb->dev, "min period size set to %u \n", min_period);
+    }
 
     spin_lock(&priv->pb_stream.lock);
     priv->pb_stream.substream = subs;
@@ -1259,6 +1272,25 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
         priv->rec_stream.owner = priv;
         priv->pb_stream.owner = priv;
         priv->disconnected = false;
+
+        /* Validate and apply USB scheduling module parameter */
+        if (uframes_per_urb != 1 && uframes_per_urb != 2 &&
+            uframes_per_urb != 4 && uframes_per_urb != 8) {
+            dev_warn(&dev->dev,
+                "Invalid uframes_per_urb=%u, clamping to 2\n",
+                uframes_per_urb);
+            uframes_per_urb = 2;
+        }
+        priv->rt_uframes_per_urb = uframes_per_urb;
+        priv->rt_num_urbs = 256 / uframes_per_urb;
+        priv->rt_total_uframes = priv->rt_num_urbs * priv->rt_uframes_per_urb;
+        priv->rt_num_urbs_mask = priv->rt_num_urbs - 1;
+        priv->rt_total_uframes_mask = priv->rt_total_uframes - 1;
+        priv->rt_rec_safety_offset = max(4u, uframes_per_urb);
+        dev_info(&dev->dev,
+            "USB scheduling: uframes_per_urb=%u num_urbs=%u total_uframes=%u rec_safety=%u\n",
+            priv->rt_uframes_per_urb, priv->rt_num_urbs,
+            priv->rt_total_uframes, priv->rt_rec_safety_offset);
 
         mutex_init(&priv->pcm_mutex);
 
