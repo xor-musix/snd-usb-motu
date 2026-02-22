@@ -27,10 +27,10 @@ static int sample_rate = 48000;
 module_param(sample_rate, int, 0644);
 MODULE_PARM_DESC(sample_rate, "Sample rate in Hz (44100, 48000, 88200, 96000, 176400, 192000)");
 
-static unsigned int uframes_per_urb = 2;
+static unsigned int uframes_per_urb = 8;
 module_param(uframes_per_urb, uint, 0444);
 MODULE_PARM_DESC(uframes_per_urb,
-    "Microframes per URB (1,2,4,8). Lower=less latency, higher=less CPU. Default: 2");
+    "Microframes per URB (1,2,4,8). Lower=less latency, higher=less CPU. Default: 8");
 
 #define NUM_INTERRUPT_URBS  4
 #define MAX_NUM_URBS        256
@@ -1337,9 +1337,9 @@ static int motu_usb_audio_probe(struct usb_interface *intf,
         if (uframes_per_urb != 1 && uframes_per_urb != 2 &&
             uframes_per_urb != 4 && uframes_per_urb != 8) {
             dev_warn(&dev->dev,
-                "Invalid uframes_per_urb=%u, clamping to 2\n",
+                "Invalid uframes_per_urb=%u, clamping to 8\n",
                 uframes_per_urb);
-            uframes_per_urb = 2;
+            uframes_per_urb = 8;
         }
         priv->rt_uframes_per_urb = uframes_per_urb;
         priv->rt_num_urbs = 256 / uframes_per_urb;
