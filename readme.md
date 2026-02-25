@@ -59,10 +59,16 @@ cd snd-usb-motu
 ./build_and_load.sh
 ```
 
+All parameters are optional — defaults are used when omitted:
+```bash
+./build_and_load.sh --sample_rate=48000 --uframes_per_urb=128 --num_urbs=2 --bpf_factor=16
+```
+
 The script will:
 
 - Remove the generic ALSA USB Audio Class (snd-usb-audio) driver
 - Remove any previously loaded snd-usb-motu module
+- Remove any previously loaded motu module (Drumfix driver)
 - Compile this driver
 - Insert the compiled module
 
@@ -79,6 +85,50 @@ To see the driver's debug output in real-time:
 ```bash
 sudo dmesg -w
 ```
+
+## Driver‑Level Performance and Buffering Controls
+
+The driver exposes several module parameters that, together with ALSA‑level settings, control the trade‑off between **latency**, **stability**, **CPU usage**, and **memory footprint**.
+
+### Module Parameters
+
+| Parameter | Valid values | Default | Description |
+|---|---|---|---|
+| `sample_rate` | 44100, 48000, 88200, 96000, 176400, 192000 | 48000 | Initial sample rate in Hz |
+| `uframes_per_urb` | 32, 64, 128, 256, 512 | 512 | USB microframes packed into each URB |
+| `num_urbs` | 2, 4 | 4 | Isochronous URBs per stream direction |
+| `pb_safety_offset` | 2, 4, 8, 16, 32 | 16 | Playback startup safety offset (microframes) |
+| `rec_safety_offset` | 2, 4, 8, 16, 32 | 16 | Capture startup safety offset (microframes) |
+| `bpf_factor` | 16, 32 | 32 | Multiplier for minimum ALSA period size (`BYTES_PER_FRAME × bpf_factor`) |
+
+### ALSA Parameters (set by the application)
+
+| Parameter | Typical range | Description |
+|---|---|---|
+| Sample rate | 44100 – 192000 Hz | Audio sample rate negotiated via `hw_params` |
+| Buffer size | hardware‑dependent | Total ring‑buffer length in frames |
+| Period size | ≥ `bpf_factor` frames | Chunk size between interrupts / callbacks |
+
+### Impact Matrix
+
+| Tuning action | Latency | Stability | CPU usage | Memory |
+|---|---|---|---|---|
+| ↓ `uframes_per_urb` | ↓ lower | ↗ may decrease | ↑ higher (more URB completions) | ↓ smaller URBs |
+| ↓ `num_urbs` (4 → 2) | ↓ lower | ↗ less headroom | ≈ neutral | ↓ fewer buffers |
+| ↓ `pb_safety_offset` | ↓ lower | ↗ tighter margin | ≈ neutral | ≈ neutral |
+| ↓ `rec_safety_offset` | ↓ lower | ↗ tighter margin | ≈ neutral | ≈ neutral |
+| ↓ `bpf_factor` (32 → 16) | ↓ lower | ↗ smaller periods allowed | ↑ more period callbacks | ≈ neutral |
+| ↑ sample rate | ↓ lower per‑sample | ↗ higher data rate | ↑ more data per second | ↑ larger buffers |
+| ↓ ALSA buffer size | ↓ lower | ↗ less safety margin | ≈ neutral | ↓ smaller ring buffer |
+| ↓ ALSA period size | ↓ lower | ↗ tighter scheduling | ↑ more wakeups | ≈ neutral |
+
+> **Hint — low‑latency starting point:**
+> `uframes_per_urb=64 num_urbs=2 pb_safety_offset=4 rec_safety_offset=4 bpf_factor=16`
+> combined with a small ALSA period/buffer. Increase values if you experience xruns.
+
+> **Hint — maximum stability:**
+> Keep all defaults (`uframes_per_urb=512 num_urbs=4 pb_safety_offset=16 rec_safety_offset=16 bpf_factor=32`)
+> and use larger ALSA buffers.
 
 ## Disclaimer
 

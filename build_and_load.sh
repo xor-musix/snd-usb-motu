@@ -1,8 +1,25 @@
 #!/bin/bash
 
-# First argument is sample_rate, default to 48000 if not provided
-sample_rate=${1:-48000}
-echo "Using sample rate '$sample_rate'"
+# Parse named arguments
+sample_rate=""
+uframes_per_urb=""
+num_urbs=""
+pb_safety_offset=""
+rec_safety_offset=""
+bpf_factor=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sample_rate=*)       sample_rate="${1#*=}" ;;
+        --uframes_per_urb=*)   uframes_per_urb="${1#*=}" ;;
+        --num_urbs=*)          num_urbs="${1#*=}" ;;
+        --pb_safety_offset=*)  pb_safety_offset="${1#*=}" ;;
+        --rec_safety_offset=*) rec_safety_offset="${1#*=}" ;;
+        --bpf_factor=*)        bpf_factor="${1#*=}" ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+    shift
+done
 
 echo "Removing UAC Driver..."
 sudo rmmod snd-usb-audio
@@ -34,8 +51,17 @@ make
 if [ $? -eq 0 ]; then
     echo "Compilation successful"
     
-    echo "Inserting MOTU Pro Audio Driver..."
-    sudo insmod snd-usb-motu.ko sample_rate=$sample_rate
+    # Build insmod parameter string
+    params=""
+    [ -n "$sample_rate" ]       && params="$params sample_rate=$sample_rate"
+    [ -n "$uframes_per_urb" ]   && params="$params uframes_per_urb=$uframes_per_urb"
+    [ -n "$num_urbs" ]          && params="$params num_urbs=$num_urbs"
+    [ -n "$pb_safety_offset" ]  && params="$params pb_safety_offset=$pb_safety_offset"
+    [ -n "$rec_safety_offset" ] && params="$params rec_safety_offset=$rec_safety_offset"
+    [ -n "$bpf_factor" ]        && params="$params bpf_factor=$bpf_factor"
+
+    echo "Inserting MOTU Pro Audio Driver with: $params"
+    sudo insmod snd-usb-motu.ko $params
     
     # Check if insmod was successful
     if [ $? -eq 0 ]; then
