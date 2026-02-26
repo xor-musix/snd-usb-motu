@@ -7,6 +7,7 @@ num_urbs=""
 pb_safety_offset=""
 rec_safety_offset=""
 bpf_factor=""
+use_cfc=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -16,6 +17,7 @@ while [[ $# -gt 0 ]]; do
         --pb_safety_offset=*)  pb_safety_offset="${1#*=}" ;;
         --rec_safety_offset=*) rec_safety_offset="${1#*=}" ;;
         --bpf_factor=*)        bpf_factor="${1#*=}" ;;
+        --use_cfc=*)           use_cfc="${1#*=}" ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
     shift
@@ -59,6 +61,7 @@ if [ $? -eq 0 ]; then
     [ -n "$pb_safety_offset" ]  && params="$params pb_safety_offset=$pb_safety_offset"
     [ -n "$rec_safety_offset" ] && params="$params rec_safety_offset=$rec_safety_offset"
     [ -n "$bpf_factor" ]        && params="$params bpf_factor=$bpf_factor"
+    [ -n "$use_cfc" ]           && params="$params use_cfc=$use_cfc"
 
     echo "Inserting MOTU Pro Audio Driver with: $params"
     sudo insmod snd-usb-motu.ko $params

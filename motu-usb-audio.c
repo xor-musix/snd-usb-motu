@@ -47,6 +47,10 @@ static int bpf_factor = 32;
 module_param(bpf_factor, int, 0644);
 MODULE_PARM_DESC(bpf_factor, "Minimum ALSA period size in bytes multiplicator (16, 32 (default))");
 
+static bool use_cfc = false;
+module_param(use_cfc, bool, 0644);
+MODULE_PARM_DESC(use_cfc, "Use precise frame scheduling (CFC). Only enable on xHCI 1.1+ controllers with CFC support. Default: false (uses URB_ISO_ASAP).");
+
 static int total_uframes;
 
 #define NUM_INTERRUPT_URBS  4
@@ -71,18 +75,12 @@ static inline int compute_nom_sample_count(unsigned int sr)
 {
     switch (sr) {
     case 44100:
-    case 48000:
-        return 6;
-    case 88200:
-        return 11;
-    case 96000:
-        return 12;
-    case 176400:
-        return 22;
-    case 192000:
-        return 24;
-    default:
-        return -EINVAL;
+    case 48000:  return 6;
+    case 88200:  return 11;
+    case 96000:  return 12;
+    case 176400: return 22;
+    case 192000: return 24;
+    default:     return -EINVAL;
     }
 }
 
@@ -136,9 +134,11 @@ static void validate_module_params(struct device *dev)
     total_uframes = num_urbs * uframes_per_urb;
 
     dev_info(dev, "Module params: sample_rate=%d uframes_per_urb=%d num_urbs=%d "
-             "pb_safety_offset=%d rec_safety_offset=%d bpf_factor=%d total_uframes=%d\n",
+             "pb_safety_offset=%d rec_safety_offset=%d bpf_factor=%d total_uframes=%d "
+             "use_cfc=%d\n",
              sample_rate, uframes_per_urb, num_urbs,
-             pb_safety_offset, rec_safety_offset, bpf_factor, total_uframes);
+             pb_safety_offset, rec_safety_offset, bpf_factor, total_uframes,
+             use_cfc);
 }
 
 #define CIRC_SUB(a, b, size)    (((a) + (size) - (b)) % (size))
@@ -351,9 +351,9 @@ static void count_sample_frames(struct motu_usb_data *priv)
 
     for (int i = 0; i < uframes_per_urb; ++i) {
         struct motu_buf *buf = &rec_stream->bufs[chase_pos];
-        
+
         buf->length = count_uframe_sample_frames(priv, buf->data);
-        
+
         if (buf->length) {
             count += prev_frames;
             prev_frames = buf->length;
@@ -367,7 +367,7 @@ static void count_sample_frames(struct motu_usb_data *priv)
             /* too many buffers without finding any frames */
             break;
         }
-        
+
         chase_pos = (chase_pos + 1) % total_uframes;
     }
 
@@ -387,7 +387,7 @@ static void mute_period_to_usb(struct motu_stream *stream,
         memset(dst_buf->data + dst_offset, 0, bytes_this_copy);
 
         period_size -= frames_this_copy;
-        
+
         stream->copy_frame += frames_this_copy;
         if (stream->copy_frame >= dst_buf->length) {
             stream->copy_frame = 0;
@@ -406,7 +406,7 @@ static void copy_period_to_usb(struct motu_stream *stream,
         mute_period_to_usb(stream, period_size);
         return;
     }
-    
+
     src = stream->substream->runtime->dma_area;
     src_offset = substream_position_bytes(stream);
 
@@ -418,10 +418,10 @@ static void copy_period_to_usb(struct motu_stream *stream,
         unsigned int dst_offset = stream->copy_frame * BYTES_PER_FRAME;
 
         memcpy(dst_buf->data + dst_offset, src + src_offset, bytes_this_copy);
-        
+
         src_offset += bytes_this_copy;
         period_size -= frames_this_copy;
-        
+
         stream->copy_frame += frames_this_copy;
         if (stream->copy_frame >= dst_buf->length) {
             stream->copy_frame = 0;
@@ -445,7 +445,7 @@ static void sync_period_from_usb(struct motu_stream *stream,
             break;
 
         period_size -= frames_this_copy;
-        
+
         stream->copy_frame += frames_this_copy;
         if (stream->copy_frame >= src_buf->length) {
             shred_sample_frames(stream, stream->bufs[stream->copy_pos].data);
@@ -465,7 +465,7 @@ static void copy_period_from_usb(struct motu_stream *stream,
         sync_period_from_usb(stream, period_size);
         return;
     }
-    
+
     dst = stream->substream->runtime->dma_area;
     dst_offset = substream_position_bytes(stream);
 
@@ -483,7 +483,7 @@ static void copy_period_from_usb(struct motu_stream *stream,
 
         dst_offset += bytes_this_copy;
         period_size -= frames_this_copy;
-        
+
         stream->copy_frame += frames_this_copy;
         if (stream->copy_frame >= src_buf->length) {
             shred_sample_frames(stream, stream->bufs[stream->copy_pos].data);
@@ -501,14 +501,14 @@ static void handle_interval_interrupt(struct motu_usb_data *priv)
     struct motu_stream *rec_stream = &priv->rec_stream;
     struct motu_stream *pb_stream = &priv->pb_stream;
     unsigned int period_size = priv->interrupt.interval;
-    
+
     count_sample_frames(priv);
-    
+
     if (rec_stream->copy_pos == total_uframes) {
         /* Capture startup - Sync copy position */
         if (priv->rx_frames < (period_size + rec_safety_offset))
             return;
-        
+
         int discard = priv->rx_frames - (period_size + rec_safety_offset);
         rec_stream->copy_pos = 0;
 
@@ -518,7 +518,7 @@ static void handle_interval_interrupt(struct motu_usb_data *priv)
             ++rec_stream->copy_pos;
         }
 
-        dev_info(&priv->usb->dev, 
+        dev_info(&priv->usb->dev,
             "Rec Copy Sync: %d (chase: %u, count: %u)\n",
             rec_stream->copy_pos, priv->chase_pos, priv->rx_frames);
     }
@@ -526,12 +526,12 @@ static void handle_interval_interrupt(struct motu_usb_data *priv)
         /* Playback startup - Sync copy position */
         int adjust = (priv->chase_pos + pb_safety_offset) -
             (uframes_per_urb * 2);
-        
+
         pb_stream->copy_pos = (total_uframes + adjust) % total_uframes;
         priv->pb_start_state = PB_START_RUNNING;
 
         dev_info(&priv->usb->dev,
-            "PB Copy Sync: %u (adjust: %d chase: %u)\n", 
+            "PB Copy Sync: %u (adjust: %d chase: %u)\n",
             pb_stream->copy_pos, adjust, priv->chase_pos);
     }
     else if (priv->pb_adj) {
@@ -575,7 +575,7 @@ static void handle_status_interrupt(struct class_interrupt_msg *msg,
 static void interrupt_complete_urb(struct urb* urb)
 {
     struct motu_interrupt_msg *msg = urb->transfer_buffer;
-    
+
     if (urb->status == 0) {
         if (msg->info == 0x01 && msg->attr == 0x01)
             handle_interval_interrupt(urb->context);
@@ -722,7 +722,7 @@ static void stop_streaming_endpoints(struct work_struct *work)
     
     if (!atomic_cmpxchg(&priv->streams_started, 1, 0))
        return;
-    
+
     dev_info(&priv->usb->dev, "stop_streaming_endpoints\n");
 
     priv->pb_adj_total = 0;
@@ -809,14 +809,14 @@ static int alloc_stream_urbs(struct motu_usb_data *priv,
             transfer_buffer = usb_alloc_coherent(priv->usb,
                                 transfer_buffer_length,
                                 GFP_KERNEL, &transfer_dma);
-            
+
             if (!transfer_buffer)
                 goto out_free;
         }
         
         urbs[i]->dev = priv->usb;
         urbs[i]->pipe = pipe;
-        urbs[i]->transfer_flags = URB_NO_TRANSFER_DMA_MAP | URB_ISO_ASAP;
+        urbs[i]->transfer_flags = URB_NO_TRANSFER_DMA_MAP | (use_cfc ? 0 : URB_ISO_ASAP);
         urbs[i]->transfer_buffer = transfer_buffer;
         urbs[i]->transfer_dma = transfer_dma;
         urbs[i]->transfer_buffer_length = max_packet_size * uframes_per_urb;
