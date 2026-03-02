@@ -1259,6 +1259,24 @@ static void pb_adj_write(struct snd_info_entry *entry,
     }
 }
 
+static void soft_reset_read(struct snd_info_entry *entry,
+                            struct snd_info_buffer *buffer)
+{
+    snd_iprintf(buffer, "Write any value to trigger a soft reset of USB streams.\n");
+}
+
+static void soft_reset_write(struct snd_info_entry *entry,
+                             struct snd_info_buffer *buffer)
+{
+    struct motu_usb_data *priv = entry->private_data;
+    char line[16];
+
+    if (!snd_info_get_line(buffer, line, sizeof(line))) {
+        dev_info(&priv->usb->dev, "soft_reset triggered\n");
+        restart_streaming_endpoints(priv);
+    }
+}
+
 static void motu_create_proc_entry(struct motu_usb_data *priv)
 {
     struct snd_info_entry *entry;
@@ -1273,6 +1291,18 @@ static void motu_create_proc_entry(struct motu_usb_data *priv)
     entry->c.text.read = pb_adj_read;
     entry->c.text.write = pb_adj_write;
     
+    snd_info_register(entry);
+
+    entry = snd_info_create_card_entry(priv->card, "soft_reset",
+        priv->card->proc_root);
+
+    if (!entry)
+        return;
+
+    entry->private_data = priv;
+    entry->c.text.read = soft_reset_read;
+    entry->c.text.write = soft_reset_write;
+
     snd_info_register(entry);
 }
 
