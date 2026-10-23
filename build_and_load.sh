@@ -8,6 +8,10 @@ pb_safety_offset=""
 rec_safety_offset=""
 bpf_factor=""
 use_cfc=""
+auto_restart=""
+restart_xrun=""
+index=""
+id=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -18,6 +22,10 @@ while [[ $# -gt 0 ]]; do
         --rec_safety_offset=*) rec_safety_offset="${1#*=}" ;;
         --bpf_factor=*)        bpf_factor="${1#*=}" ;;
         --use_cfc=*)           use_cfc="${1#*=}" ;;
+        --auto_restart=*)      auto_restart="${1#*=}" ;;
+        --restart_xrun=*)      restart_xrun="${1#*=}" ;;
+        --index=*)             index="${1#*=}" ;;
+        --id=*)                id="${1#*=}" ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
     shift
@@ -62,6 +70,10 @@ if [ $? -eq 0 ]; then
     [ -n "$rec_safety_offset" ] && params="$params rec_safety_offset=$rec_safety_offset"
     [ -n "$bpf_factor" ]        && params="$params bpf_factor=$bpf_factor"
     [ -n "$use_cfc" ]           && params="$params use_cfc=$use_cfc"
+    [ -n "$auto_restart" ]      && params="$params auto_restart=$auto_restart"
+    [ -n "$restart_xrun" ]      && params="$params restart_xrun=$restart_xrun"
+    [ -n "$index" ]             && params="$params index=$index"
+    [ -n "$id" ]                && params="$params id=$id"
 
     echo "Inserting MOTU Pro Audio Driver with: $params"
     sudo insmod snd-usb-motu.ko $params

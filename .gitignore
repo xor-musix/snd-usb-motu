@@ -11,3 +11,5 @@
 *.cmd
 *.symvers
 *.order
+# Hardware test results
+tests/results/
