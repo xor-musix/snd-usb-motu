@@ -11,5 +11,14 @@
 *.cmd
 *.symvers
 *.order
+
+# DKMS build artifacts
+dkms-*/
+*.dkms
+dkms.conf.bak
+
 # Hardware test results
 tests/results/
+
+# Backup files
+*.bak

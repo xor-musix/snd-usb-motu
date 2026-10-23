@@ -81,6 +81,37 @@ In my experience, you can run this script with the device connected. If you enco
 1. Ensure the device's clock is set to SAMPLE_RATE and is locked
 1. Reconnect the device
 
+
+## Installing as a DKMS Module
+
+For permanent installation with automatic kernel rebuilds:
+
+```bash
+git clone -b hardening https://github.com/dylan-motu/snd-usb-motu
+cd snd-usb-motu
+sudo ./dkms_install.sh
+```
+
+The script builds the module for all installed kernels (skips already-installed ones).
+
+### Load the module
+
+```bash
+sudo modprobe snd-usb-motu
+```
+
+### Uninstall
+
+```bash
+sudo ./dkms_uninstall.sh
+```
+
+### Verify
+
+```bash
+dkms status -m snd-usb-motu
+```
+
 ## Viewing Logs
 To see the driver's debug output in real-time:
 ```bash

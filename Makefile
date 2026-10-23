@@ -28,4 +28,24 @@ clean:
 install:
 	install -D $(TARGET) $(DESTDIR)/lib/modules/$(TARGET)
 
+# DKMS targets - uses individual dkms install for each kernel
+dkms_install:
+	@echo "Installing $(TARGET) via DKMS (building for all kernels)..."
+	@./dkms_install.sh
+
+dkms_remove:
+	@echo "Removing $(TARGET) from DKMS..."
+	@sudo dkms remove $(TARGET:.ko=)/1.0 --all
+
+dkms_status:
+	@echo "DKMS status for $(TARGET):"
+	@dkms status -m $(TARGET:.ko=)
+
+# Verify DKMS installation for all kernels
+dkms_verify:
+	@echo "Verifying DKMS installation for all kernels..."
+	@./dkms_verify.sh
+
+.PHONY: default clean install dkms_install dkms_remove dkms_status dkms_verify
+
 endif
