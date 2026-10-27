@@ -227,14 +227,35 @@ echo 1 | sudo tee /proc/asound/motuusb/soft_reset
 
 xHCI controllers with the Contiguous Frame ID Capability (CFC) can schedule
 isochronous transfers on explicit, contiguous frame numbers instead of "as soon
-as possible". Check your controller with:
+as possible". The driver logs the selected scheduling mode at probe; check with:
 
 ```bash
-sudo dmesg | grep 'hcc params'
+dmesg | grep 'Isochronous scheduling'
+# or, on systems that store kernel logs in systemd journal:
+journalctl -k --no-pager | grep 'Isochronous scheduling'
 ```
 
-CFC is supported if bit 11 (`0x800`) of the `hcc params` value is set.
+The log message indicates the selected mode and the reasoning:
 
+- **`URB_ISO_ASAP`** (default on kernels older than 7.3 or when CFC not available)
+- **`CFC`** (when controller supports it and kernel is known to schedule gap-free)
+
+If the driver logs `"controller supports CFC, xHCI driver not known to schedule it gap-free"`,
+it means CFC is supported by hardware but the kernel lacks the necessary fixes
+(kernel bugzilla [220748](https://bugzilla.kernel.org/show_bug.cgi?id=220748)),
+so the driver falls back to `URB_ISO_ASAP` for reliability.
+
+**Alternative check**: The xHCI HCCPARAMS1 register (offset 0x10) contains the
+CFC capability bit (bit 11 = `0x800`). On systems where `dmesg` is restricted,
+check the driver's probe log or run:
+
+```bash
+journalctl -k --no-pager | grep 'hcc params'
+```
+
+The value `0x20007fc1` (or similar) indicates CFC is supported if bit 11 (0x800) is set.
+You can verify with: `python3 -c 'print("CFC:", bool(0x20007fc1 & 0x800))'`
+| 
 - `use_cfc=-1` (default): the driver reads the capability from the controller
   and uses CFC only if it is supported **and** the kernel's xHCI driver is known
   to schedule CFC streams without inserting gaps of its own (see
